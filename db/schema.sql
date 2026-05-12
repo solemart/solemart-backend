@@ -345,3 +345,90 @@ CREATE TRIGGER trg_shoes_updated_at
 CREATE TRIGGER trg_orders_updated_at
   BEFORE UPDATE ON orders
   FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- ============================================================
+--  CHANNEL LISTINGS  (cross-platform: eBay, Vinted, Depop)
+-- ============================================================
+CREATE TABLE channel_listings (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  shoe_id         UUID NOT NULL REFERENCES shoes(id) ON DELETE CASCADE,
+  platform        VARCHAR(20) NOT NULL CHECK (platform IN ('ebay','vinted','depop')),
+  status          VARCHAR(20) NOT NULL DEFAULT 'pending'
+                  CHECK (status IN (
+                    'pending',      -- owner opted in, awaiting staff action
+                    'listed',       -- live on the platform
+                    'sold',         -- sold on this platform
+                    'delisted',     -- removed from this platform
+                    'failed'        -- listing attempt failed
+                  )),
+  -- Platform-specific details (filled by staff)
+  platform_listing_id   VARCHAR(200),  -- eBay item ID, Vinted ID etc.
+  platform_listing_url  TEXT,          -- direct link to the listing
+  platform_price        NUMERIC(10,2), -- price set on that platform
+  -- Fee structure: 20% for external platform sales
+  platform_fee_pct      NUMERIC(5,2) DEFAULT 20.00,
+  -- Notes from staff
+  notes           TEXT,
+  -- Timestamps
+  opted_in_at     TIMESTAMPTZ DEFAULT NOW(),
+  listed_at       TIMESTAMPTZ,
+  sold_at         TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (shoe_id, platform)
+);
+
+CREATE INDEX idx_channel_shoe    ON channel_listings(shoe_id);
+CREATE INDEX idx_channel_status  ON channel_listings(platform, status);
+
+-- ============================================================
+--  CHARITY DONATIONS
+-- ============================================================
+CREATE TABLE donations (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  reference       VARCHAR(30) UNIQUE NOT NULL, -- e.g. DON-ABC-1234
+  -- Donor details (no account required)
+  donor_user_id   UUID REFERENCES users(id),   -- NULL if guest
+  donor_name      VARCHAR(200) NOT NULL,
+  donor_email     VARCHAR(255) NOT NULL,
+  donor_phone     VARCHAR(30),
+  -- Shoes
+  shoe_description TEXT NOT NULL,
+  pair_count      SMALLINT NOT NULL DEFAULT 1,
+  notes           TEXT,
+  -- Collection address
+  collection_line1    VARCHAR(200) NOT NULL,
+  collection_line2    VARCHAR(200),
+  collection_city     VARCHAR(100),
+  collection_county   VARCHAR(100),
+  collection_postcode VARCHAR(20) NOT NULL,
+  -- Charity
+  charity_name    VARCHAR(200) DEFAULT 'Soles4Souls UK',
+  charity_number  VARCHAR(50)  DEFAULT '1157346',
+  -- Status
+  status          VARCHAR(20) DEFAULT 'pending'
+                  CHECK (status IN (
+                    'pending',      -- submitted, awaiting collection
+                    'collected',    -- picked up from donor
+                    'processing',   -- being authenticated & cleaned
+                    'listed',       -- live on platform
+                    'profit_transferred', -- profits sent to charity
+                    'cancelled'
+                  )),
+  -- Financials
+  collection_fee  NUMERIC(10,2) DEFAULT 3.99,
+  total_revenue   NUMERIC(10,2) DEFAULT 0,  -- accumulated from rentals/sales
+  label_url       TEXT,
+  -- Timestamps
+  submitted_at    TIMESTAMPTZ DEFAULT NOW(),
+  collected_at    TIMESTAMPTZ,
+  listed_at       TIMESTAMPTZ,
+  transferred_at  TIMESTAMPTZ
+);
+
+CREATE INDEX idx_donations_email  ON donations(donor_email);
+CREATE INDEX idx_donations_status ON donations(status);
+
+-- Link donated shoes to the donation record
+ALTER TABLE shoes ADD COLUMN IF NOT EXISTS donation_id UUID REFERENCES donations(id);
+CREATE INDEX IF NOT EXISTS idx_shoes_donation ON shoes(donation_id);

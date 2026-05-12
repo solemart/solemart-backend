@@ -157,6 +157,26 @@ const sendCleanBookingConfirmation = (contact, booking, labelUrl) => send(
   `)}</div>`
 );
 
+const sendDonationConfirmation = (donor, donation, labelUrl) => send(
+  donor.email,
+  `Donation confirmed — ${donation.reference}`,
+  `<div style="${baseStyle}">${card(`
+    ${h1('Thank You for Donating 💚')}
+    ${p(`Hi ${donor.name}, your shoe donation has been confirmed. We'll collect from your address and every penny of profit will go directly to <strong>${donation.charity_name}</strong>.`)}
+    ${ref(donation.reference)}
+    <table style="width:100%;border-collapse:collapse;font-size:13px;margin:18px 0">
+      <tr><td style="padding:8px 0;color:#7a7369;border-bottom:1px solid #e4e0da">Shoes</td><td style="padding:8px 0;border-bottom:1px solid #e4e0da;text-align:right">${donation.shoe_description}</td></tr>
+      <tr><td style="padding:8px 0;color:#7a7369;border-bottom:1px solid #e4e0da">Pairs</td><td style="padding:8px 0;border-bottom:1px solid #e4e0da;text-align:right">${donation.pair_count}</td></tr>
+      <tr><td style="padding:8px 0;color:#7a7369;border-bottom:1px solid #e4e0da">Charity</td><td style="padding:8px 0;border-bottom:1px solid #e4e0da;text-align:right;color:#1a7a4a;font-weight:600">${donation.charity_name}</td></tr>
+      <tr><td style="padding:8px 0;font-weight:600">Collection Fee</td><td style="padding:8px 0;text-align:right;font-weight:600">£${donation.collection_fee}</td></tr>
+    </table>
+    <div style="background:#eaf5f0;border:1px solid #a8d9bf;border-radius:4px;padding:14px;font-size:13px;color:#1a7a4a;margin:16px 0">
+      💚 100% of all rental income and sale proceeds go directly to ${donation.charity_name} (Registered Charity No. ${donation.charity_number}). We publish quarterly impact reports at solemart.co.uk/charity.
+    </div>
+    ${labelUrl ? `<p style="font-size:13px;margin-top:16px"><a href="${labelUrl}" style="color:#b89a5a">Download your collection label →</a></p>` : ''}
+  `)}</div>`
+);
+
 module.exports = {
   sendWelcome,
   sendOrderConfirmation,
@@ -166,4 +186,5 @@ module.exports = {
   sendShoeListed,
   sendShoeRejected,
   sendCleanBookingConfirmation,
+  sendDonationConfirmation,
 };

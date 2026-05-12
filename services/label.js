@@ -28,7 +28,15 @@ const generateCleanLabel = async ({ reference, contact, returnAddress, service, 
   return `${process.env.STORAGE_PUBLIC_URL}/labels/${reference}.pdf`;
 };
 
-module.exports = { generateListingLabel, generateCleanLabel };
+/**
+ * Generate a charity donation collection label.
+ */
+const generateDonationLabel = async ({ reference, donor, collectionAddress, pairCount }) => {
+  logger.info(`Generating donation label for ${reference}`);
+  return `${process.env.STORAGE_PUBLIC_URL}/labels/${reference}.pdf`;
+};
+
+module.exports = { generateListingLabel, generateCleanLabel, generateDonationLabel };
 
 
 // ============================================================
