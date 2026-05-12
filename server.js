@@ -15,6 +15,7 @@ const reviewRoutes      = require('./routes/reviews');
 const adminRoutes       = require('./routes/admin');
 const payoutRoutes      = require('./routes/payouts');
 const postcodeRoutes    = require('./routes/postcodes');
+const channelRoutes     = require('./routes/channels');
 const webhookRoutes     = require('./routes/webhooks');
 const errorHandler      = require('./middleware/errorHandler');
 const logger            = require('./config/logger');
@@ -22,8 +23,15 @@ const logger            = require('./config/logger');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(helmet());
-app.use(cors({ origin: '*' }));
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(cors({
+  origin: '*',
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  optionsSuccessStatus: 200,
+}));
+app.options('*', cors());
+
 app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }), webhookRoutes);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -35,14 +43,14 @@ if (process.env.NODE_ENV !== 'test') {
 }
 
 const globalLimiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
-  max: parseInt(process.env.RATE_LIMIT_MAX) || 100,
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
 });
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: parseInt(process.env.AUTH_RATE_LIMIT_MAX) || 10,
+  max: 10,
   message: { error: 'Too many auth attempts.' },
 });
 
@@ -59,20 +67,6 @@ app.use('/api/shoes',       shoeRoutes);
 app.use('/api/submissions', submissionRoutes);
 app.use('/api/orders',      orderRoutes);
 app.use('/api/cleans',      cleanRoutes);
-app.use('/api/reviews',     reviewRoutes);
-app.use('/api/admin',       adminRoutes);
-app.use('/api/payouts',     payoutRoutes);
-app.use('/api/postcodes',   postcodeRoutes);
+app.use('/api/revi
 
-app.use((req, res) => {
-  res.status(404).json({ error: 'Route not found' });
-});
 
-app.use(errorHandler);
-
-app.listen(PORT, () => {
-  logger.info(`SoleMart API running on port ${PORT} [${process.env.NODE_ENV}]`);
-});
-
-module.exports = app;
-// cors fix Tue 12 May 2026 20:12:18 BST
