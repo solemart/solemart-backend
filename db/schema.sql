@@ -67,8 +67,9 @@ CREATE TABLE shoes (
   -- Listing configuration
   listing_type  VARCHAR(10) NOT NULL DEFAULT 'both'
                 CHECK (listing_type IN ('rent','buy','both')),
-  rent_price    NUMERIC(10,2),
-  buy_price     NUMERIC(10,2),
+  rrp           NUMERIC(10,2),   -- original retail price — base for all pricing calculations
+  rent_price    NUMERIC(10,2),   -- calculated: 15% of RRP × wear grade multiplier ÷ 7 (daily)
+  buy_price     NUMERIC(10,2),   -- calculated: RRP × grade buy multiplier
   -- Condition & status
   condition     VARCHAR(30) CHECK (condition IN ('Brand New','Like New','Very Good','Good','Fair')),
   status        VARCHAR(20) NOT NULL DEFAULT 'submitted'
@@ -89,6 +90,9 @@ CREATE TABLE shoes (
   auth_notes    TEXT,
   auth_by       UUID REFERENCES users(id),  -- staff member
   auth_at       TIMESTAMPTZ,
+  -- Wear Life — assessed by staff at intake (pre-loved) or auto Mint (new)
+  assessed_wear_grade VARCHAR(10) CHECK (assessed_wear_grade IN ('Mint','Excellent','Good','Fair','Vintage')),
+  is_pre_loved  BOOLEAN DEFAULT FALSE,
   -- Cleaning
   clean_method  VARCHAR(100),
   clean_notes   TEXT,
