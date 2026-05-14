@@ -190,10 +190,53 @@ router.get('/users', requireRole('admin'), async (req, res, next) => {
   try {
     const { rows } = await db.query(
       `SELECT id, first_name, last_name, email, role, phone,
-              email_verified, created_at
-       FROM users ORDER BY created_at DESC LIMIT 200`
+              addr_line1, addr_line2, addr_city, addr_county, addr_postcode,
+              shoe_size, email_verified, created_at
+       FROM users ORDER BY created_at DESC LIMIT 500`
     );
     res.json(rows);
+  } catch (err) { next(err); }
+});
+
+// ── PATCH /api/admin/users/:id  (admin updates any user) ──────
+router.patch('/users/:id', requireRole('admin'), [
+  body('first_name').optional().trim().notEmpty(),
+  body('last_name').optional().trim().notEmpty(),
+  body('email').optional().isEmail().normalizeEmail(),
+  body('phone').optional().trim(),
+  body('role').optional().isIn(['customer','owner','staff','admin']),
+], async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(422).json({ errors: errors.array() });
+
+    const allowed = ['first_name','last_name','email','phone','role'];
+    const updates = [];
+    const values  = [];
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) {
+        values.push(req.body[key]);
+        updates.push(`${key} = $${values.length}`);
+      }
+    }
+    if (!updates.length) return res.status(400).json({ error: 'No fields to update' });
+
+    values.push(req.params.id);
+    const { rows } = await db.query(
+      `UPDATE users SET ${updates.join(', ')}, updated_at = NOW()
+       WHERE id = $${values.length}
+       RETURNING id, first_name, last_name, email, phone, role,
+                 addr_line1, addr_line2, addr_city, addr_county, addr_postcode,
+                 shoe_size, email_verified, created_at`,
+      values
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    await logActivity(req.user.id, 'user.updated', 'user', req.params.id, {
+      updated_fields: allowed.filter(k=>req.body[k]!==undefined),
+    });
+
+    res.json(rows[0]);
   } catch (err) { next(err); }
 });
 
