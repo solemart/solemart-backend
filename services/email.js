@@ -11,7 +11,7 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-const FROM = process.env.EMAIL_FROM || 'SoleMart <hello@solemart.co.uk>';
+const FROM = process.env.EMAIL_FROM || 'Kosmos <hello@kosmos.co.uk>';
 
 const send = async (to, subject, html) => {
   try {
@@ -34,8 +34,8 @@ const card = (content) => `
     </div>
     <div style="padding:36px 32px">${content}</div>
     <div style="background:#f3f0eb;padding:18px 32px;font-size:11px;color:#7a7369;text-align:center;border-top:1px solid #e4e0da">
-      SoleMart Ltd · Unit 4, CleanWorks Industrial, Bermondsey St, London SE1 3UB<br/>
-      <a href="https://solemart.co.uk" style="color:#b89a5a">solemart.co.uk</a>
+      Kosmos Ltd · Unit 4, CleanWorks Industrial, Bermondsey St, London SE1 3UB<br/>
+      <a href="https://kosmos.co.uk" style="color:#b89a5a">kosmos.co.uk</a>
     </div>
   </div>`;
 
@@ -50,11 +50,11 @@ const ref = (text) =>
 
 const sendWelcome = (user) => send(
   user.email,
-  'Welcome to SoleMart',
+  'Welcome to Kosmos',
   `<div style="${baseStyle}">${card(`
     ${h1(`Welcome, ${user.first_name}.`)}
-    ${p('Your SoleMart account is all set. Browse the collection, list your shoes, or book a professional clean — all from one place.')}
-    ${btn('Browse the Collection', 'https://solemart.co.uk')}
+    ${p('Your Kosmos account is all set. Browse the collection, list your shoes, or book a professional clean — all from one place.')}
+    ${btn('Browse the Collection', 'https://kosmos.co.uk')}
   `)}</div>`
 );
 
@@ -71,7 +71,7 @@ const sendOrderConfirmation = (user, order, shoe) => send(
       <tr><td style="padding:8px 0;color:#7a7369;border-bottom:1px solid #e4e0da">Type</td><td style="padding:8px 0;border-bottom:1px solid #e4e0da;text-align:right">${order.order_type === 'rent' ? `Rental · ${order.rental_days} days` : 'Purchase'}</td></tr>
       <tr><td style="padding:8px 0;font-weight:600">Total</td><td style="padding:8px 0;text-align:right;font-weight:600;color:#b89a5a">£${order.total}</td></tr>
     </table>
-    ${btn('View Order', `https://solemart.co.uk/account`)}
+    ${btn('View Order', `https://kosmos.co.uk/account`)}
   `)}</div>`
 );
 
@@ -84,7 +84,7 @@ const sendOrderDispatched = (user, order) => send(
     ${ref(order.reference)}
     ${order.tracking_number ? p(`<strong>Tracking:</strong> ${order.tracking_number}`) : ''}
     ${order.return_label_url && order.order_type === 'rent' ? p('Your <strong>return label</strong> is attached — keep it safe for when your rental ends.') : ''}
-    ${btn('View Order', `https://solemart.co.uk/account`)}
+    ${btn('View Order', `https://kosmos.co.uk/account`)}
   `)}</div>`
 );
 
@@ -123,7 +123,7 @@ const sendShoeListed = (user, shoe) => send(
       <div style="font-size:20px;font-weight:600">${shoe.auth_grade}</div>
     </div>
     ${p(`You'll be notified and paid within 7 days of each completed rental or sale. You earn 85% of every transaction.`)}
-    ${btn('View My Listings', 'https://solemart.co.uk/account')}
+    ${btn('View My Listings', 'https://kosmos.co.uk/account')}
   `)}</div>`
 );
 
@@ -137,7 +137,7 @@ const sendShoeRejected = (user, shoe) => send(
       <strong>Reason:</strong> ${shoe.rejection_reason}
     </div>
     ${p('We will return your shoes to your collection address within 5 business days. If you have any questions, please don\'t hesitate to get in touch.')}
-    ${btn('Contact Us', 'https://solemart.co.uk/contact')}
+    ${btn('Contact Us', 'https://kosmos.co.uk/contact')}
   `)}</div>`
 );
 
@@ -171,7 +171,7 @@ const sendDonationConfirmation = (donor, donation, labelUrl) => send(
       <tr><td style="padding:8px 0;font-weight:600">Collection Fee</td><td style="padding:8px 0;text-align:right;font-weight:600">£${donation.collection_fee}</td></tr>
     </table>
     <div style="background:#eaf5f0;border:1px solid #a8d9bf;border-radius:4px;padding:14px;font-size:13px;color:#1a7a4a;margin:16px 0">
-      💚 100% of all rental income and sale proceeds go directly to ${donation.charity_name} (Registered Charity No. ${donation.charity_number}). We publish quarterly impact reports at solemart.co.uk/charity.
+      💚 100% of all rental income and sale proceeds go directly to ${donation.charity_name} (Registered Charity No. ${donation.charity_number}). We publish quarterly impact reports at kosmos.co.uk/charity.
     </div>
     ${labelUrl ? `<p style="font-size:13px;margin-top:16px"><a href="${labelUrl}" style="color:#b89a5a">Download your collection label →</a></p>` : ''}
   `)}</div>`

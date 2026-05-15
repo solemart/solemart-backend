@@ -47,5 +47,5 @@ app.use('/api/channels',    channelRoutes);
 app.use('/api/donations',   donationRoutes);
 app.use((req, res) => { res.status(404).json({ error: 'Route not found' }); });
 app.use(errorHandler);
-app.listen(PORT, () => { logger.info(`SoleMart API running on port ${PORT} [${process.env.NODE_ENV}]`); });
+app.listen(PORT, () => { logger.info(`Kosmos API running on port ${PORT} [${process.env.NODE_ENV}]`); });
 module.exports = app;
