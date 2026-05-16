@@ -15,7 +15,7 @@ router.get('/', optionalAuth, async (req, res, next) => {
       size,
       sort = 'newest',
       page = 1,
-      limit = 20,
+      limit = 100,
     } = req.query;
 
     const offset = (parseInt(page) - 1) * parseInt(limit);
