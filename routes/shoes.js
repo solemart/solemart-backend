@@ -54,8 +54,9 @@ router.get('/', optionalAuth, async (req, res, next) => {
       `SELECT
          s.id, s.brand, s.model, s.size, s.colour, s.category, s.gender,
          s.description, s.emoji, s.listing_type, s.rent_price, s.buy_price,
-         s.condition, s.auth_grade, s.auth_score,
+         s.rrp, s.condition, s.auth_grade, s.auth_score,
          s.rental_count, s.clean_count, s.listing_count, s.listed_at,
+         s.assessed_wear_grade, s.is_pre_loved, s.donation_id,
          u.first_name || ' ' || LEFT(u.last_name, 1) || '.' AS owner_display,
          ROUND(AVG(r.stars), 1) AS avg_rating,
          COUNT(r.id)            AS review_count,
