@@ -9,32 +9,36 @@ const router  = express.Router();
 
 // POST /api/reviews
 router.post('/', authenticate, [
-  body('order_id').isUUID(),
   body('stars').isInt({ min: 1, max: 5 }),
-  body('body').trim().isLength({ min: 10 }).withMessage('Review must be at least 10 characters'),
+  body('body').trim().isLength({ min: 3 }).withMessage('Review must be at least 3 characters'),
 ], async (req, res, next) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(422).json({ errors: errors.array() });
 
-    const { order_id, stars, body: reviewBody } = req.body;
+    const { order_id, shoe_id, stars, body: reviewBody } = req.body;
 
-    // Verify order belongs to this customer and is completed
-    const { rows: orderRows } = await db.query(
-      `SELECT * FROM orders WHERE id = $1 AND customer_id = $2`,
-      [order_id, req.user.id]
-    );
-    if (!orderRows.length) return res.status(404).json({ error: 'Order not found' });
-    if (!['completed','returned','delivered'].includes(orderRows[0].status)) {
-      return res.status(409).json({ error: 'You can only review completed orders' });
+    let resolvedShoeId = shoe_id;
+    let resolvedOrderId = order_id || null;
+
+    // If order_id provided, verify it belongs to this customer
+    if (order_id) {
+      const { rows: orderRows } = await db.query(
+        `SELECT * FROM orders WHERE id = $1 AND customer_id = $2`,
+        [order_id, req.user.id]
+      );
+      if (!orderRows.length) return res.status(404).json({ error: 'Order not found' });
+      resolvedShoeId = orderRows[0].shoe_id;
     }
+
+    if (!resolvedShoeId) return res.status(400).json({ error: 'shoe_id or order_id required' });
 
     const { rows } = await db.query(
       `INSERT INTO reviews (order_id, shoe_id, customer_id, stars, body)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (order_id) DO UPDATE SET stars = $4, body = $5
        RETURNING *`,
-      [order_id, orderRows[0].shoe_id, req.user.id, stars, reviewBody]
+      [resolvedOrderId, resolvedShoeId, req.user.id, stars, reviewBody]
     );
     res.status(201).json(rows[0]);
   } catch (err) { next(err); }
