@@ -225,9 +225,9 @@ const seed = async () => {
 
     if (orderRows[0]) {
       await db.query(`
-        INSERT INTO payouts (owner_id, order_id, amount, status, payout_type, created_at)
-        VALUES ($1,$2,$3,$4,$5,$6)
-      `, [ownerId, orderRows[0].id, owner_amount, opts.payoutStatus, opts.type === 'rent' ? 'rental' : 'sale', created]);
+        INSERT INTO payouts (owner_id, order_id, shoe_id, amount, status, payout_type, created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `, [ownerId, orderRows[0].id, shoeId, owner_amount, opts.payoutStatus, opts.type === 'rent' ? 'rental' : 'sale', created]);
     }
   };
 
@@ -245,7 +245,7 @@ const seed = async () => {
     await insertOrder(mikeShoes[0]?.id, priyaId||janeId,  mikeId, { type:'rent', subtotal:45,  days:7,  status:'completed', daysAgo:8, payoutStatus:'pending' });
     await insertOrder(mikeShoes[1]?.id, janeId,           mikeId, { type:'rent', subtotal:63,  days:14, status:'completed', daysAgo:3, payoutStatus:'pending' });
     // Active rental
-    await insertOrder(mikeShoes[2]?.id, priyaId||janeId,  mikeId, { type:'rent', subtotal:45,  days:7,  status:'active',    daysAgo:2, payoutStatus:'pending' });
+    await insertOrder(mikeShoes[2]?.id, priyaId||janeId,  mikeId, { type:'rent', subtotal:45,  days:7,  status:'active_rental',    daysAgo:2, payoutStatus:'pending' });
   }
 
   if (sophieShoes.length && priyaId) {
@@ -258,7 +258,7 @@ const seed = async () => {
     await insertOrder(sophieShoes[2]?.id, priyaId,  sophieId, { type:'rent', subtotal:21,  days:7,  status:'completed', daysAgo:20, payoutStatus:'paid' });
     await insertOrder(sophieShoes[0]?.id, janeId,   sophieId, { type:'rent', subtotal:42,  days:14, status:'completed', daysAgo:10, payoutStatus:'pending' });
     await insertOrder(sophieShoes[1]?.id, priyaId,  sophieId, { type:'rent', subtotal:21,  days:7,  status:'completed', daysAgo:4,  payoutStatus:'pending' });
-    await insertOrder(sophieShoes[2]?.id, janeId,   sophieId, { type:'buy',  subtotal:75,  status:'active',              daysAgo:1,  payoutStatus:'pending' });
+    await insertOrder(sophieShoes[2]?.id, janeId,   sophieId, { type:'buy',  subtotal:75,  status:'active_rental',              daysAgo:1,  payoutStatus:'pending' });
   }
 
   if (jamesShoes.length && janeId) {
@@ -269,7 +269,7 @@ const seed = async () => {
     await insertOrder(jamesShoes[1]?.id, janeId,           jamesId, { type:'buy',  subtotal:120, status:'completed',           daysAgo:35, payoutStatus:'paid' });
     await insertOrder(jamesShoes[2]?.id||jamesShoes[0]?.id, priyaId||janeId, jamesId, { type:'rent', subtotal:54, days:14, status:'completed', daysAgo:15, payoutStatus:'paid' });
     await insertOrder(jamesShoes[0]?.id, janeId,           jamesId, { type:'rent', subtotal:27,  days:7,  status:'completed', daysAgo:6,  payoutStatus:'pending' });
-    await insertOrder(jamesShoes[1]?.id, priyaId||janeId,  jamesId, { type:'rent', subtotal:54,  days:14, status:'active',    daysAgo:2,  payoutStatus:'pending' });
+    await insertOrder(jamesShoes[1]?.id, priyaId||janeId,  jamesId, { type:'rent', subtotal:54,  days:14, status:'active_rental',    daysAgo:2,  payoutStatus:'pending' });
   }
 
   if (amaraShoes.length && priyaId) {
@@ -280,7 +280,7 @@ const seed = async () => {
     await insertOrder(amaraShoes[1]?.id, priyaId, amaraId, { type:'buy',  subtotal:75,  status:'completed',           daysAgo:50, payoutStatus:'paid' });
     await insertOrder(amaraShoes[2]?.id||amaraShoes[0]?.id, janeId, amaraId, { type:'rent', subtotal:35, days:7, status:'completed', daysAgo:25, payoutStatus:'paid' });
     await insertOrder(amaraShoes[0]?.id, priyaId, amaraId, { type:'rent', subtotal:35,  days:7,  status:'completed', daysAgo:5,  payoutStatus:'pending' });
-    await insertOrder(amaraShoes[1]?.id, janeId,  amaraId, { type:'rent', subtotal:70,  days:14, status:'active',    daysAgo:1,  payoutStatus:'pending' });
+    await insertOrder(amaraShoes[1]?.id, janeId,  amaraId, { type:'rent', subtotal:70,  days:14, status:'active_rental',    daysAgo:1,  payoutStatus:'pending' });
   }
 
   // Jane's order history (as a customer)
