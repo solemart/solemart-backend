@@ -198,7 +198,35 @@ router.get('/users', requireRole('admin'), async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── PATCH /api/admin/users/:id  (admin updates any user) ──────
+// ── PATCH /api/admin/users/:id/password  (admin resets a user's password) ──
+router.patch('/users/:id/password', requireRole('admin'), [
+  body('new_password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters'),
+], async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(422).json({ errors: errors.array() });
+
+    const bcrypt = require('bcryptjs');
+    const password_hash = await bcrypt.hash(req.body.new_password, parseInt(process.env.BCRYPT_ROUNDS) || 12);
+
+    const { rows } = await db.query(
+      `UPDATE users SET password_hash = $1, updated_at = NOW()
+       WHERE id = $2 RETURNING id, email`,
+      [password_hash, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    // Revoke all refresh tokens so user must log in again
+    await db.query(
+      'UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1',
+      [req.params.id]
+    );
+
+    await logActivity(req.user.id, 'user.password_reset', 'user', req.params.id);
+
+    res.json({ message: 'Password updated. All existing sessions have been revoked.' });
+  } catch (err) { next(err); }
+});
 router.patch('/users/:id', requireRole('admin'), [
   body('first_name').optional().trim().notEmpty(),
   body('last_name').optional().trim().notEmpty(),
@@ -250,6 +278,65 @@ router.get('/activity', async (req, res, next) => {
        ORDER BY al.created_at DESC LIMIT 100`
     );
     res.json(rows);
+  } catch (err) { next(err); }
+});
+
+// ── PAYOUTS ADMIN ──────────────────────────────────────────────────────────────
+router.get('/payouts', requireRole('staff'), async (req, res, next) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT p.*,
+         u.first_name || ' ' || u.last_name AS owner_name,
+         COALESCE(s.brand, sd.brand) AS brand,
+         COALESCE(s.model, sd.model) AS model
+       FROM payouts p
+       JOIN users u ON u.id = p.owner_id
+       LEFT JOIN orders o ON o.id = p.order_id
+       LEFT JOIN shoes s ON s.id = o.shoe_id
+       LEFT JOIN shoes sd ON sd.id = p.shoe_id
+       ORDER BY p.created_at DESC`
+    );
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
+router.patch('/payouts/:id', requireRole('staff'), async (req, res, next) => {
+  try {
+    const { status } = req.body;
+    const processed_at = status === 'paid' ? new Date() : null;
+    const { rows } = await db.query(
+      `UPDATE payouts SET status=$1, processed_at=COALESCE($2,processed_at) WHERE id=$3 RETURNING *`,
+      [status, processed_at, req.params.id]
+    );
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
+// ── SHOES ADMIN PATCH ──────────────────────────────────────────────────────────
+router.patch('/shoes/:id', requireRole('staff'), async (req, res, next) => {
+  try {
+    const allowed = ['status','assessed_wear_grade','rejection_reason','auth_grade','auth_score'];
+    const updates = Object.entries(req.body).filter(([k]) => allowed.includes(k));
+    if (!updates.length) return res.status(400).json({ error: 'No valid fields' });
+    const setClauses = updates.map(([k], i) => `${k}=$${i+2}`).join(',');
+    const values = updates.map(([,v]) => v);
+    const { rows } = await db.query(
+      `UPDATE shoes SET ${setClauses}, updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [req.params.id, ...values]
+    );
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
+// ── ORDERS ADMIN PATCH ─────────────────────────────────────────────────────────
+router.patch('/orders/:id', requireRole('staff'), async (req, res, next) => {
+  try {
+    const { status } = req.body;
+    const { rows } = await db.query(
+      `UPDATE orders SET status=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+      [status, req.params.id]
+    );
+    res.json(rows[0]);
   } catch (err) { next(err); }
 });
 
