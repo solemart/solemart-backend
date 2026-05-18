@@ -10,10 +10,18 @@ const router  = express.Router();
 router.get('/', authenticate, async (req, res, next) => {
   try {
     const { rows } = await db.query(
-      `SELECT p.*, o.reference AS order_ref, s.brand, s.model
+      `SELECT
+         p.*,
+         o.reference        AS order_ref,
+         o.rental_days,
+         o.subtotal         AS gross_amount,
+         COALESCE(s.brand, sd.brand)  AS brand,
+         COALESCE(s.model, sd.model)  AS model,
+         COALESCE(s.emoji, sd.emoji)  AS shoe_emoji
        FROM payouts p
-       LEFT JOIN orders o ON o.id = p.order_id
-       LEFT JOIN shoes s ON s.id = o.shoe_id
+       LEFT JOIN orders o  ON o.id  = p.order_id
+       LEFT JOIN shoes  s  ON s.id  = o.shoe_id
+       LEFT JOIN shoes  sd ON sd.id = p.shoe_id
        WHERE p.owner_id = $1
        ORDER BY p.created_at DESC`,
       [req.user.id]
