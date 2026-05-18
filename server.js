@@ -23,7 +23,26 @@ const logger = require('./config/logger');
 const app = express();
 const PORT = process.env.PORT || 3001;
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({ origin: '*', methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'], optionsSuccessStatus: 200 }));
+const allowedOrigins = [
+  'https://beautifullyordered.com',
+  'https://www.beautifullyordered.com',
+  'https://kosmos.netlify.app',
+  'http://localhost:8081',
+  'http://localhost:19006',
+];
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow mobile app requests (no origin) and allowed domains
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  optionsSuccessStatus: 200,
+}));
 app.options('*', cors());
 app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }), webhookRoutes);
 app.use(express.json({ limit: '10mb' }));

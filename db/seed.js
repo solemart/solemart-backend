@@ -61,15 +61,22 @@ const seed = async () => {
     ON CONFLICT (email) DO UPDATE SET role = 'owner' RETURNING id
   `, [pw123]);
 
-  const mikeId  = mikeRows[0]?.id;
-  const sophieId = sophieRows[0]?.id;
-  const jamesId  = jamesRows[0]?.id;
-  const amaraId  = amaraRows[0]?.id;
+  const mikeId   = mikeRows[0]?.id  || (await db.query(`SELECT id FROM users WHERE email = 'mike@example.com'`)).rows[0]?.id;
+  const sophieId = sophieRows[0]?.id || (await db.query(`SELECT id FROM users WHERE email = 'sophie@example.com'`)).rows[0]?.id;
+  const jamesId  = jamesRows[0]?.id  || (await db.query(`SELECT id FROM users WHERE email = 'james@example.com'`)).rows[0]?.id;
+  const amaraId  = amaraRows[0]?.id  || (await db.query(`SELECT id FROM users WHERE email = 'amara@example.com'`)).rows[0]?.id;
 
   if (!mikeId) {
-    console.log('Owners already exist, skipping shoe seed. Run with fresh DB to re-seed.');
-    process.exit(0);
+    console.log('Could not find owner IDs — aborting.');
+    process.exit(1);
   }
+
+  // Clear existing shoes and orders for a clean re-seed
+  console.log('🗑  Clearing existing shoes, orders and payouts...');
+  await db.query(`DELETE FROM payouts`);
+  await db.query(`DELETE FROM reviews`);
+  await db.query(`DELETE FROM orders`);
+  await db.query(`DELETE FROM shoes`);
 
   const insertShoe = async (ownerId, s) => {
     await db.query(`
