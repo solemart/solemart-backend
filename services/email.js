@@ -1,41 +1,53 @@
-const nodemailer = require('nodemailer');
-const logger     = require('../config/logger');
+const { Resend } = require('resend');
+const logger = require('../config/logger');
 
-const transporter = nodemailer.createTransport({
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+
+// Fallback to SMTP if Resend not configured
+const nodemailer = require('nodemailer');
+const smtpTransporter = process.env.SMTP_HOST ? nodemailer.createTransport({
   host:   process.env.SMTP_HOST,
   port:   parseInt(process.env.SMTP_PORT) || 587,
   secure: process.env.SMTP_SECURE === 'true',
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+}) : null;
 
-const FROM = process.env.EMAIL_FROM || 'Kosmos <hello@kosmos.co.uk>';
+const FROM = process.env.EMAIL_FROM || 'Kosmos <hello@beautifullyordered.com>';
 
 const send = async (to, subject, html) => {
   try {
-    await transporter.sendMail({ from: FROM, to, subject, html });
-    logger.info(`Email sent to ${to}: ${subject}`);
+    if (resend) {
+      await resend.emails.send({ from: FROM, to, subject, html });
+      logger.info(`Email sent via Resend to ${to}: ${subject}`);
+    } else if (smtpTransporter) {
+      await smtpTransporter.sendMail({ from: FROM, to, subject, html });
+      logger.info(`Email sent via SMTP to ${to}: ${subject}`);
+    } else {
+      logger.warn(`No email provider configured — skipping email to ${to}: ${subject}`);
+    }
   } catch (err) {
     logger.error(`Email failed to ${to}: ${err.message}`);
-    throw err;
+    // Don't throw — allow API to continue even if email fails
   }
 };
 
+// Backwards compat alias
+const sendEmail = send;
+
 // ── Shared styles ─────────────────────────────────────────────
 const baseStyle = `
-  font-family: 'Georgia', serif; background: #f7f5f2; padding: 40px 0; color: #1a1714;
+  font-family: 'Georgia', serif; background: #faf8f5; padding: 40px 0; color: #0f0e0c;
 `;
 const card = (content) => `
-  <div style="max-width:560px;margin:0 auto;background:#fff;border:1px solid #e4e0da;border-radius:6px;overflow:hidden">
-    <div style="background:#0f0e0c;padding:24px 32px;text-align:center">
-      <span style="font-size:24px;letter-spacing:4px;text-transform:uppercase;color:#f7f5f2">Sole<span style="color:#b89a5a">Mart</span></span>
+  <div style="max-width:560px;margin:0 auto;background:#fff;border:1px solid #e8e4dd;border-radius:10px;overflow:hidden">
+    <div style="background:#0f0e0c;padding:28px 32px;text-align:center">
+      <div style="font-family:Georgia,serif;font-size:32px;color:#faf8f5;font-weight:300">Kosmos</div>
+      <div style="font-size:10px;letter-spacing:2.5px;text-transform:uppercase;color:#b89a5a;margin-top:4px">Beautifully Ordered</div>
     </div>
     <div style="padding:36px 32px">${content}</div>
-    <div style="background:#f3f0eb;padding:18px 32px;font-size:11px;color:#7a7369;text-align:center;border-top:1px solid #e4e0da">
-      Kosmos Ltd · Unit 4, CleanWorks Industrial, Bermondsey St, London SE1 3UB<br/>
-      <a href="https://kosmos.co.uk" style="color:#b89a5a">kosmos.co.uk</a>
+    <div style="background:#f4efe7;padding:18px 32px;font-size:11px;color:#7a7468;text-align:center;border-top:1px solid #e8e4dd">
+      Beautifully Ordered Ltd<br/>
+      <a href="https://beautifullyordered.com" style="color:#b89a5a">beautifullyordered.com</a>
     </div>
   </div>`;
 
