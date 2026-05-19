@@ -177,6 +177,27 @@ const sendDonationConfirmation = (donor, donation, labelUrl) => send(
   `)}</div>`
 );
 
+// ── PASSWORD RESET ────────────────────────────────────────────────────────────
+const sendPasswordResetEmail = (to, firstName, code) => sendEmail(
+  to,
+  `Your Kosmos password reset code is ${code}`,
+  `<div style="font-family:Georgia,serif;max-width:560px;margin:0 auto;padding:40px 20px;background:#faf8f5">
+    <div style="text-align:center;margin-bottom:32px">
+      <h1 style="font-family:Georgia,serif;font-size:32px;color:#0f0e0c;font-weight:300;margin:0">Kosmos</h1>
+      <p style="font-size:10px;letter-spacing:2px;text-transform:uppercase;color:#b89a5a;margin-top:4px">Beautifully Ordered</p>
+    </div>
+    <div style="background:#fff;border:1px solid #e8e4dd;border-radius:10px;padding:32px;text-align:center">
+      <h2 style="font-family:Georgia,serif;font-size:24px;color:#0f0e0c;font-weight:300;margin:0 0 16px">Reset your password</h2>
+      <p style="color:#7a7468;font-size:14px;line-height:1.6;margin-bottom:24px">Hi ${firstName || 'there'},<br/>Enter this code in the Kosmos app to set a new password. It expires in 30 minutes.</p>
+      <div style="background:#f4efe7;border:1px solid #d9d3c7;border-radius:10px;padding:24px;margin:24px 0">
+        <div style="font-family:'Courier New',monospace;font-size:36px;letter-spacing:8px;color:#0f0e0c;font-weight:700">${code}</div>
+      </div>
+      <p style="color:#a39d8e;font-size:12px;line-height:1.6">Didn't request this? You can safely ignore this email — your password won't change.</p>
+    </div>
+    <p style="color:#a39d8e;font-size:11px;text-align:center;margin-top:24px">Need help? Reply to this email or contact support@beautifullyordered.com</p>
+  </div>`
+);
+
 module.exports = {
   sendWelcome,
   sendOrderConfirmation,
@@ -187,4 +208,5 @@ module.exports = {
   sendShoeRejected,
   sendCleanBookingConfirmation,
   sendDonationConfirmation,
+  sendPasswordResetEmail,
 };
