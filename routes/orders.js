@@ -64,12 +64,19 @@ router.post('/', authenticate, [
       [order_type === 'rent' ? 'rented' : 'sold', shoe_id]
     );
 
-    // Create Stripe payment intent
-    const paymentIntent = await stripeService.createPaymentIntent({
-      amount: Math.round(total * 100), // pence
-      currency: 'gbp',
-      metadata: { shoe_id, order_type, customer_id: req.user.id },
-    });
+    // Create Stripe payment intent (optional — only if Stripe is configured)
+    let paymentIntent = { id: null, client_secret: null };
+    if (process.env.STRIPE_SECRET_KEY) {
+      try {
+        paymentIntent = await stripeService.createPaymentIntent({
+          amount: Math.round(total * 100),
+          currency: 'gbp',
+          metadata: { shoe_id, order_type, customer_id: req.user.id },
+        });
+      } catch (e) {
+        console.warn('Stripe payment intent failed (continuing without):', e.message);
+      }
+    }
 
     const reference = genRef('ORD');
     const rentalStart = order_type === 'rent' ? new Date() : null;
