@@ -282,7 +282,7 @@ router.get('/activity', async (req, res, next) => {
 });
 
 // ── PAYOUTS ADMIN ──────────────────────────────────────────────────────────────
-router.get('/payouts', requireRole('staff'), async (req, res, next) => {
+router.get('/payouts', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { rows } = await db.query(
       `SELECT p.*,
@@ -300,7 +300,7 @@ router.get('/payouts', requireRole('staff'), async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.patch('/payouts/:id', requireRole('staff'), async (req, res, next) => {
+router.patch('/payouts/:id', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { status } = req.body;
     const processed_at = status === 'paid' ? new Date() : null;
@@ -313,7 +313,7 @@ router.patch('/payouts/:id', requireRole('staff'), async (req, res, next) => {
 });
 
 // ── SHOES ADMIN PATCH ──────────────────────────────────────────────────────────
-router.patch('/shoes/:id', requireRole('staff'), async (req, res, next) => {
+router.patch('/shoes/:id', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const allowed = ['status','assessed_wear_grade','rejection_reason','auth_grade','auth_score'];
     const updates = Object.entries(req.body).filter(([k]) => allowed.includes(k));
@@ -329,7 +329,7 @@ router.patch('/shoes/:id', requireRole('staff'), async (req, res, next) => {
 });
 
 // ── ORDERS ADMIN PATCH ─────────────────────────────────────────────────────────
-router.patch('/orders/:id', requireRole('staff'), async (req, res, next) => {
+router.patch('/orders/:id', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { status } = req.body;
     const { rows } = await db.query(
@@ -340,10 +340,28 @@ router.patch('/orders/:id', requireRole('staff'), async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── GET /api/admin/orders — all orders for revenue dashboard ──────────────────
+router.get('/orders', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT o.*,
+              s.brand, s.model, s.emoji,
+              u.first_name || ' ' || u.last_name AS customer_name,
+              u.email AS customer_email
+       FROM orders o
+       LEFT JOIN shoes s ON s.id = o.shoe_id
+       LEFT JOIN users u ON u.id = o.customer_id
+       ORDER BY o.created_at DESC
+       LIMIT 1000`
+    );
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
 // ── CUSTOMER SERVICE ACTIONS ───────────────────────────────────────────────────
 
 // POST /api/admin/orders/:id/refund — partial or full refund via Stripe
-router.post('/orders/:id/refund', requireRole('staff'), async (req, res, next) => {
+router.post('/orders/:id/refund', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { amount, reason, cancel } = req.body;
     const { rows: [order] } = await db.query(`SELECT * FROM orders WHERE id=$1`, [req.params.id]);
@@ -381,7 +399,7 @@ router.post('/orders/:id/refund', requireRole('staff'), async (req, res, next) =
 });
 
 // POST /api/admin/orders/:id/credit — issue store credit
-router.post('/orders/:id/credit', requireRole('staff'), async (req, res, next) => {
+router.post('/orders/:id/credit', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { amount, reason } = req.body;
     const { rows: [order] } = await db.query(`SELECT customer_id FROM orders WHERE id=$1`, [req.params.id]);
@@ -416,7 +434,7 @@ router.post('/orders/:id/credit', requireRole('staff'), async (req, res, next) =
 });
 
 // POST /api/admin/orders/:id/flag — flag for review
-router.post('/orders/:id/flag', requireRole('staff'), async (req, res, next) => {
+router.post('/orders/:id/flag', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { reason } = req.body;
     await db.query(
@@ -429,7 +447,7 @@ router.post('/orders/:id/flag', requireRole('staff'), async (req, res, next) => 
 });
 
 // POST /api/admin/orders/:id/note — add internal note
-router.post('/orders/:id/note', requireRole('staff'), async (req, res, next) => {
+router.post('/orders/:id/note', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { note } = req.body;
     await db.query(
