@@ -189,4 +189,133 @@ router.post('/webhook', async (req, res) => {
   res.json({ received: true });
 });
 
+// ── STRIPE CHECKOUT (web) ──────────────────────────────────────────────────────
+// POST /api/stripe/checkout — create a hosted checkout session for web
+router.post('/checkout', authenticate, async (req, res, next) => {
+  try {
+    const { items, delivery } = req.body;
+    if (!Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: 'Cart is empty' });
+    }
+
+    // Validate items and calculate amounts
+    let totalAmount = 0;
+    const lineItems = [];
+    const orderInputs = [];
+    let hasRental = false;
+
+    for (const item of items) {
+      const { rows: [shoe] } = await db.query(`SELECT * FROM shoes WHERE id = $1`, [item.shoe_id]);
+      if (!shoe) return res.status(404).json({ error: `Shoe ${item.shoe_id} not found` });
+      if (shoe.status !== 'listed') return res.status(409).json({ error: `${shoe.brand} ${shoe.model} is not available` });
+
+      const unitPrice = item.order_type === 'rent' ? parseFloat(shoe.rent_price) : parseFloat(shoe.buy_price);
+      const subtotal  = item.order_type === 'rent' ? unitPrice * item.rental_days : unitPrice;
+      const platformFee = parseFloat((subtotal * 0.15).toFixed(2));
+      const total = parseFloat((subtotal + platformFee).toFixed(2));
+      if (item.order_type === 'rent') hasRental = true;
+      totalAmount += total;
+
+      lineItems.push({
+        price_data: {
+          currency: 'gbp',
+          product_data: {
+            name: `${shoe.brand} ${shoe.model}`,
+            description: item.order_type === 'rent'
+              ? `${item.rental_days}-day rental · UK ${shoe.size}`
+              : `Purchase · UK ${shoe.size}`,
+          },
+          unit_amount: Math.round(total * 100),
+        },
+        quantity: 1,
+      });
+
+      orderInputs.push({ shoe, item, unitPrice, subtotal, platformFee, total });
+    }
+
+    const { stripe } = require('../services/stripe');
+
+    // Get or create Stripe Customer for this user
+    const { rows: userRows } = await db.query(`SELECT * FROM users WHERE id = $1`, [req.user.id]);
+    const user = userRows[0];
+    let customerId = user.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        name: `${user.first_name} ${user.last_name}`,
+        metadata: { kosmos_user_id: req.user.id },
+      });
+      customerId = customer.id;
+      await db.query(`UPDATE users SET stripe_customer_id = $1 WHERE id = $2`, [customerId, req.user.id]);
+    }
+
+    // Create orders with status 'pending_payment'
+    const orderIds = [];
+    for (const o of orderInputs) {
+      const reference = 'ORD-' + Math.random().toString(36).slice(2, 5).toUpperCase() + '-' + Date.now().toString().slice(-4);
+      const rentalEnd = o.item.order_type === 'rent'
+        ? new Date(Date.now() + o.item.rental_days * 86400000) : null;
+
+      const { rows } = await db.query(
+        `INSERT INTO orders
+          (reference, customer_id, shoe_id, order_type, status,
+           unit_price, rental_days, subtotal, platform_fee, total,
+           delivery_line1, delivery_line2, delivery_city, delivery_postcode,
+           rental_start_date, rental_end_date)
+         VALUES ($1,$2,$3,$4,'pending_payment',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         RETURNING id`,
+        [reference, req.user.id, o.shoe.id, o.item.order_type, o.unitPrice,
+         o.item.order_type === 'rent' ? o.item.rental_days : null,
+         o.subtotal, o.platformFee, o.total,
+         delivery.line1, delivery.line2 || null, delivery.city || 'London', delivery.postcode,
+         o.item.order_type === 'rent' ? new Date() : null, rentalEnd]
+      );
+      orderIds.push(rows[0].id);
+    }
+
+    const successUrl = `${process.env.APP_URL || 'https://beautifullyordered.com'}?stripe=success&session_id={CHECKOUT_SESSION_ID}`;
+    const cancelUrl = `${process.env.APP_URL || 'https://beautifullyordered.com'}?stripe=cancel`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      customer: customerId,
+      customer_update: { address: 'auto', name: 'auto' },
+      line_items: lineItems,
+      // For rentals — save the card for future late fee charges
+      payment_intent_data: {
+        ...(hasRental ? { setup_future_usage: 'off_session' } : {}),
+        metadata: { order_ids: orderIds.join(','), user_id: req.user.id },
+      },
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: { order_ids: orderIds.join(','), user_id: req.user.id },
+    });
+
+    res.json({ checkout_url: session.url, session_id: session.id });
+  } catch (err) { next(err); }
+});
+
+// GET /api/stripe/checkout/verify?session_id=xxx
+router.get('/checkout/verify', authenticate, async (req, res, next) => {
+  try {
+    const { session_id } = req.query;
+    if (!session_id) return res.status(400).json({ error: 'session_id required' });
+    const { stripe } = require('../services/stripe');
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    const paid = session.payment_status === 'paid';
+    // Update orders to confirmed if paid
+    if (paid && session.metadata?.order_ids) {
+      const orderIds = session.metadata.order_ids.split(',');
+      for (const id of orderIds) {
+        await db.query(
+          `UPDATE orders SET status = 'confirmed', stripe_payment_intent_id = $1 WHERE id = $2`,
+          [session.payment_intent, id]
+        );
+      }
+    }
+    res.json({ paid, status: session.payment_status });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
