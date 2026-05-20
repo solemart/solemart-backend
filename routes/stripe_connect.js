@@ -120,7 +120,7 @@ router.post('/payment-intent', authenticate, async (req, res, next) => {
 // ── WEBHOOK ───────────────────────────────────────────────────────────────────
 
 // POST /api/stripe/webhook — handle Stripe events
-router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+router.post('/webhook', async (req, res) => {
   let event;
   try {
     event = constructWebhookEvent(req.body, req.headers['stripe-signature']);

@@ -47,6 +47,7 @@ app.use(cors({
 }));
 app.options('*', cors());
 app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }), webhookRoutes);
+app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 if (process.env.NODE_ENV !== 'test') { app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) } })); }
