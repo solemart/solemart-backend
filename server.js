@@ -73,5 +73,16 @@ app.use('/api/channels',    channelRoutes);
 app.use('/api/donations',   donationRoutes);
 app.use((req, res) => { res.status(404).json({ error: 'Route not found' }); });
 app.use(errorHandler);
+// ── DAILY LATE FEE PROCESSING ─────────────────────────────────────────────────
+const { processLateFees } = require('./services/lateFees');
+
+// Run once on startup (after 30 second delay), then every 24 hours
+setTimeout(() => {
+  processLateFees().catch(err => logger.error('Late fee job error:', err));
+  setInterval(() => {
+    processLateFees().catch(err => logger.error('Late fee job error:', err));
+  }, 24 * 60 * 60 * 1000);
+}, 30 * 1000);
+
 app.listen(PORT, () => { logger.info(`Kosmos API running on port ${PORT} [${process.env.NODE_ENV}]`); });
 module.exports = app;

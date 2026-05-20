@@ -66,13 +66,67 @@ router.post('/', authenticate, [
 
     // Create Stripe payment intent (optional — only if Stripe is configured)
     let paymentIntent = { id: null, client_secret: null };
+    let stripeCustomerId = null;
+    let ephemeralKeySecret = null;
     if (process.env.STRIPE_SECRET_KEY) {
       try {
-        paymentIntent = await stripeService.createPaymentIntent({
+        const { stripe } = require('../services/stripe');
+
+        // Get or create Stripe Customer for this user
+        const { rows: userRows } = await client.query(
+          `SELECT stripe_customer_id, email, first_name, last_name FROM users WHERE id = $1`,
+          [req.user.id]
+        );
+        const user = userRows[0];
+        stripeCustomerId = user.stripe_customer_id;
+        if (!stripeCustomerId) {
+          const customer = await stripe.customers.create({
+            email: user.email,
+            name: `${user.first_name} ${user.last_name}`,
+            metadata: { kosmos_user_id: req.user.id },
+          });
+          stripeCustomerId = customer.id;
+          await client.query(
+            `UPDATE users SET stripe_customer_id = $1 WHERE id = $2`,
+            [stripeCustomerId, req.user.id]
+          );
+        }
+
+        // Get owner Stripe Connect account for split payment
+        const { rows: ownerRows } = await client.query(
+          `SELECT stripe_account_id FROM users WHERE id = $1`,
+          [shoe.owner_id]
+        );
+        const ownerStripeId = ownerRows[0]?.stripe_account_id;
+
+        // Create payment intent with Customer attached so card is saved for later
+        const piParams = {
           amount: Math.round(total * 100),
           currency: 'gbp',
+          customer: stripeCustomerId,
+          setup_future_usage: order_type === 'rent' ? 'off_session' : undefined,
           metadata: { shoe_id, order_type, customer_id: req.user.id },
-        });
+          automatic_payment_methods: { enabled: true },
+        };
+
+        // Apply Connect split if owner has Stripe account
+        if (ownerStripeId) {
+          const cleaningFee = order_type === 'rent' ? 800 : 0;
+          const netAmount = piParams.amount - cleaningFee;
+          const platformFeePence = Math.round(netAmount * 0.15);
+          piParams.transfer_data = { destination: ownerStripeId, amount: netAmount - platformFeePence };
+          piParams.application_fee_amount = platformFeePence + cleaningFee;
+        }
+
+        const pi = await stripe.paymentIntents.create(piParams);
+        paymentIntent = { id: pi.id, client_secret: pi.client_secret };
+
+        // Create ephemeral key for Payment Sheet
+        const ephemeralKey = await stripe.ephemeralKeys.create(
+          { customer: stripeCustomerId },
+          { apiVersion: '2024-06-20' }
+        );
+        ephemeralKeySecret = ephemeralKey.secret;
       } catch (e) {
         console.warn('Stripe payment intent failed (continuing without):', e.message);
       }
@@ -117,7 +171,11 @@ router.post('/', authenticate, [
 
     res.status(201).json({
       order: rows[0],
-      clientSecret: paymentIntent.client_secret, // frontend uses this with Stripe.js
+      reference: rows[0].reference,
+      client_secret: paymentIntent.client_secret,
+      customer_id: stripeCustomerId,
+      ephemeral_key: ephemeralKeySecret,
+      amount: total,
     });
   } catch (err) {
     await client.query('ROLLBACK');

@@ -229,6 +229,28 @@ const sendNewsletterWelcome = (to) => sendEmail(
   </div>`
 );
 
+// ── LATE FEE CHARGED ──────────────────────────────────────────────────────────
+const sendLateFeeChargedEmail = (to, firstName, details) => sendEmail(
+  to,
+  `Late return fee charged — £${details.amount.toFixed(2)}`,
+  card(`
+    <div style="text-align:center;margin-bottom:24px">
+      <div style="font-size:32px;margin-bottom:8px">⏰</div>
+      <h2 style="font-family:Georgia,serif;font-size:24px;font-weight:300;margin:0">Late Return Fee</h2>
+    </div>
+    <p style="color:#7a7468;font-size:14px;line-height:1.6">Hi ${firstName || 'there'},</p>
+    <p style="color:#7a7468;font-size:14px;line-height:1.6">Your rental of <strong style="color:#0f0e0c">${details.brand} ${details.model}</strong> (${details.reference}) is currently ${details.days} day(s) past its return date.</p>
+    <p style="color:#7a7468;font-size:14px;line-height:1.6">In line with our terms, we've charged your card on file for the additional rental days.</p>
+    <div style="background:#fdf8e8;border:1px solid #d9c890;border-radius:10px;padding:18px;margin:18px 0;text-align:center">
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:#a07010;font-weight:600;margin-bottom:6px">Amount Charged</div>
+      <div style="font-family:Georgia,serif;font-size:32px;color:#0f0e0c;font-weight:300">£${details.amount.toFixed(2)}</div>
+      <div style="font-size:12px;color:#7a7468;margin-top:4px">${details.days} day${details.days !== 1 ? 's' : ''} × daily rental rate</div>
+    </div>
+    <p style="color:#7a7468;font-size:13px;line-height:1.6">Please return the shoes as soon as possible to stop further charges. Daily charges will continue until the rental is returned, up to the replacement value of the shoes.</p>
+    <p style="color:#7a7468;font-size:12px;line-height:1.6;margin-top:24px">Questions? Reply to this email or contact <a href="mailto:support@beautifullyordered.com" style="color:#b89a5a">support@beautifullyordered.com</a></p>
+  `)
+);
+
 module.exports = {
   sendWelcome,
   sendOrderConfirmation,
@@ -241,4 +263,5 @@ module.exports = {
   sendDonationConfirmation,
   sendPasswordResetEmail,
   sendNewsletterWelcome,
+  sendLateFeeChargedEmail,
 };
