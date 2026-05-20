@@ -340,4 +340,105 @@ router.patch('/orders/:id', requireRole('staff'), async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── CUSTOMER SERVICE ACTIONS ───────────────────────────────────────────────────
+
+// POST /api/admin/orders/:id/refund — partial or full refund via Stripe
+router.post('/orders/:id/refund', requireRole('staff'), async (req, res, next) => {
+  try {
+    const { amount, reason, cancel } = req.body;
+    const { rows: [order] } = await db.query(`SELECT * FROM orders WHERE id=$1`, [req.params.id]);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    // If Stripe is configured, attempt actual refund
+    if (process.env.STRIPE_SECRET_KEY && order.stripe_payment_intent_id) {
+      try {
+        const { stripe } = require('../services/stripe');
+        await stripe.refunds.create({
+          payment_intent: order.stripe_payment_intent_id,
+          amount: Math.round(amount * 100),
+          reason: 'requested_by_customer',
+          metadata: { order_id: req.params.id, reason: reason || '' },
+        });
+      } catch (e) {
+        console.error('Stripe refund failed:', e.message);
+      }
+    }
+
+    // Log to activity log
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, details)
+       VALUES ($1, 'refund_issued', 'order', $2, $3)`,
+      [req.user.id, req.params.id, JSON.stringify({ amount, reason })]
+    );
+
+    // Cancel order if full refund
+    if (cancel) {
+      await db.query(`UPDATE orders SET status='cancelled', updated_at=NOW() WHERE id=$1`, [req.params.id]);
+    }
+
+    res.json({ ok: true, refunded: amount });
+  } catch (err) { next(err); }
+});
+
+// POST /api/admin/orders/:id/credit — issue store credit
+router.post('/orders/:id/credit', requireRole('staff'), async (req, res, next) => {
+  try {
+    const { amount, reason } = req.body;
+    const { rows: [order] } = await db.query(`SELECT customer_id FROM orders WHERE id=$1`, [req.params.id]);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    // Add credit to user (assumes user_credits table exists, create if needed)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS user_credits (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id),
+        amount NUMERIC(10,2) NOT NULL,
+        reason TEXT,
+        order_id UUID REFERENCES orders(id),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        expires_at TIMESTAMPTZ
+      )
+    `);
+    await db.query(
+      `INSERT INTO user_credits (user_id, amount, reason, order_id, expires_at)
+       VALUES ($1, $2, $3, $4, NOW() + INTERVAL '1 year')`,
+      [order.customer_id, amount, reason, req.params.id]
+    );
+
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, details)
+       VALUES ($1, 'credit_issued', 'order', $2, $3)`,
+      [req.user.id, req.params.id, JSON.stringify({ amount, reason })]
+    );
+
+    res.json({ ok: true, credited: amount });
+  } catch (err) { next(err); }
+});
+
+// POST /api/admin/orders/:id/flag — flag for review
+router.post('/orders/:id/flag', requireRole('staff'), async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, details)
+       VALUES ($1, 'order_flagged', 'order', $2, $3)`,
+      [req.user.id, req.params.id, JSON.stringify({ reason })]
+    );
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// POST /api/admin/orders/:id/note — add internal note
+router.post('/orders/:id/note', requireRole('staff'), async (req, res, next) => {
+  try {
+    const { note } = req.body;
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, details)
+       VALUES ($1, 'order_note', 'order', $2, $3)`,
+      [req.user.id, req.params.id, JSON.stringify({ note })]
+    );
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
