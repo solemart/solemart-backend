@@ -210,6 +210,25 @@ const sendPasswordResetEmail = (to, firstName, code) => sendEmail(
   </div>`
 );
 
+// ── NEWSLETTER WELCOME ────────────────────────────────────────────────────────
+const sendNewsletterWelcome = (to) => sendEmail(
+  to,
+  `Welcome to the Kosmos list ✨`,
+  `<div style="font-family:Georgia,serif;max-width:560px;margin:0 auto;padding:40px 20px;background:#faf8f5">
+    <div style="text-align:center;margin-bottom:32px">
+      <h1 style="font-family:Georgia,serif;font-size:36px;color:#0f0e0c;font-weight:300;margin:0">Kosmos</h1>
+      <p style="font-size:10px;letter-spacing:2px;text-transform:uppercase;color:#b89a5a;margin-top:4px">Beautifully Ordered</p>
+    </div>
+    <div style="background:#fff;border:1px solid #e8e4dd;border-radius:10px;padding:32px;text-align:center">
+      <div style="font-size:48px;margin-bottom:12px">✨</div>
+      <h2 style="font-family:Georgia,serif;font-size:24px;color:#0f0e0c;font-weight:300;margin:0 0 16px">You're on the list</h2>
+      <p style="color:#7a7468;font-size:14px;line-height:1.6;margin-bottom:24px">Thanks for joining the Kosmos community. You'll be among the first to hear about new arrivals, exclusive drops and early access to special collections.</p>
+      <a href="https://beautifullyordered.com" style="display:inline-block;background:#0f0e0c;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-size:13px;font-weight:700;letter-spacing:0.5px">Browse the Edit →</a>
+    </div>
+    <p style="color:#a39d8e;font-size:11px;text-align:center;margin-top:24px">No spam — just thoughtfully curated updates. <a href="https://beautifullyordered.com/?unsub=${encodeURIComponent(to)}" style="color:#b89a5a">Unsubscribe anytime</a></p>
+  </div>`
+);
+
 module.exports = {
   sendWelcome,
   sendOrderConfirmation,
@@ -221,4 +240,5 @@ module.exports = {
   sendCleanBookingConfirmation,
   sendDonationConfirmation,
   sendPasswordResetEmail,
+  sendNewsletterWelcome,
 };
