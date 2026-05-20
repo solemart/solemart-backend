@@ -358,6 +358,34 @@ router.get('/orders', requireRole('staff', 'admin'), async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── GET /api/admin/shoes — all shoes (any status) for admin ───────────────────
+router.get('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { status } = req.query;
+    let where = '1=1';
+    const params = [];
+    if (status && status !== 'all') {
+      params.push(status);
+      where = `s.status = $${params.length}`;
+    }
+    const { rows } = await db.query(
+      `SELECT s.*,
+              u.first_name, u.last_name, u.email AS owner_email,
+              u.first_name || ' ' || u.last_name AS owner_display,
+              ls.reference AS submission_ref, ls.collection_postcode
+       FROM shoes s
+       JOIN users u ON u.id = s.owner_id
+       LEFT JOIN submission_shoes ss ON ss.shoe_id = s.id
+       LEFT JOIN listing_submissions ls ON ls.id = ss.submission_id
+       WHERE ${where}
+       ORDER BY s.created_at DESC
+       LIMIT 1000`,
+      params
+    );
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
 // ── CUSTOMER SERVICE ACTIONS ───────────────────────────────────────────────────
 
 // POST /api/admin/orders/:id/refund — partial or full refund via Stripe
