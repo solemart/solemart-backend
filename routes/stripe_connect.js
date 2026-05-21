@@ -53,7 +53,7 @@ router.get('/connect/status', authenticate, async (req, res, next) => {
 
 // GET /api/stripe/connect/return — redirect after onboarding
 router.get('/connect/return', async (req, res) => {
-  res.redirect(`${process.env.APP_URL || 'https://beautifullyordered.com'}?stripe=connected`);
+  res.redirect(`${process.env.APP_URL || 'https://beautifullyordered.co.uk'}?stripe=connected`);
 });
 
 // GET /api/stripe/connect/refresh — regenerate onboarding link
@@ -279,8 +279,8 @@ router.post('/checkout', authenticate, async (req, res, next) => {
       orderIds.push(rows[0].id);
     }
 
-    const successUrl = `${process.env.APP_URL || 'https://beautifullyordered.com'}?stripe=success&session_id={CHECKOUT_SESSION_ID}`;
-    const cancelUrl = `${process.env.APP_URL || 'https://beautifullyordered.com'}?stripe=cancel`;
+    const successUrl = `${process.env.APP_URL || 'https://beautifullyordered.co.uk'}?stripe=success&session_id={CHECKOUT_SESSION_ID}`;
+    const cancelUrl = `${process.env.APP_URL || 'https://beautifullyordered.co.uk'}?stripe=cancel`;
 
     // Calculate Connect split — only works for single-shoe carts
     let paymentIntentExtras = {};

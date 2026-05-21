@@ -12,7 +12,7 @@ const smtpTransporter = process.env.SMTP_HOST ? nodemailer.createTransport({
   auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
 }) : null;
 
-const FROM = process.env.EMAIL_FROM || 'Kosmos <hello@beautifullyordered.com>';
+const FROM = process.env.EMAIL_FROM || 'Kosmos <hello@beautifullyordered.co.uk>';
 
 const send = async (to, subject, html) => {
   try {
@@ -47,7 +47,7 @@ const card = (content) => `
     <div style="padding:36px 32px">${content}</div>
     <div style="background:#f4efe7;padding:18px 32px;font-size:11px;color:#7a7468;text-align:center;border-top:1px solid #e8e4dd">
       Beautifully Ordered Ltd<br/>
-      <a href="https://beautifullyordered.com" style="color:#b89a5a">beautifullyordered.com</a>
+      <a href="https://beautifullyordered.co.uk" style="color:#b89a5a">beautifullyordered.co.uk</a>
     </div>
   </div>`;
 
@@ -206,7 +206,7 @@ const sendPasswordResetEmail = (to, firstName, code) => sendEmail(
       </div>
       <p style="color:#a39d8e;font-size:12px;line-height:1.6">Didn't request this? You can safely ignore this email — your password won't change.</p>
     </div>
-    <p style="color:#a39d8e;font-size:11px;text-align:center;margin-top:24px">Need help? Reply to this email or contact support@beautifullyordered.com</p>
+    <p style="color:#a39d8e;font-size:11px;text-align:center;margin-top:24px">Need help? Reply to this email or contact support@beautifullyordered.co.uk</p>
   </div>`
 );
 
@@ -223,9 +223,9 @@ const sendNewsletterWelcome = (to) => sendEmail(
       <div style="font-size:48px;margin-bottom:12px">✨</div>
       <h2 style="font-family:Georgia,serif;font-size:24px;color:#0f0e0c;font-weight:300;margin:0 0 16px">You're on the list</h2>
       <p style="color:#7a7468;font-size:14px;line-height:1.6;margin-bottom:24px">Thanks for joining the Kosmos community. You'll be among the first to hear about new arrivals, exclusive drops and early access to special collections.</p>
-      <a href="https://beautifullyordered.com" style="display:inline-block;background:#0f0e0c;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-size:13px;font-weight:700;letter-spacing:0.5px">Browse the Edit →</a>
+      <a href="https://beautifullyordered.co.uk" style="display:inline-block;background:#0f0e0c;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-size:13px;font-weight:700;letter-spacing:0.5px">Browse the Edit →</a>
     </div>
-    <p style="color:#a39d8e;font-size:11px;text-align:center;margin-top:24px">No spam — just thoughtfully curated updates. <a href="https://beautifullyordered.com/?unsub=${encodeURIComponent(to)}" style="color:#b89a5a">Unsubscribe anytime</a></p>
+    <p style="color:#a39d8e;font-size:11px;text-align:center;margin-top:24px">No spam — just thoughtfully curated updates. <a href="https://beautifullyordered.co.uk/?unsub=${encodeURIComponent(to)}" style="color:#b89a5a">Unsubscribe anytime</a></p>
   </div>`
 );
 
@@ -247,7 +247,7 @@ const sendLateFeeChargedEmail = (to, firstName, details) => sendEmail(
       <div style="font-size:12px;color:#7a7468;margin-top:4px">${details.days} day${details.days !== 1 ? 's' : ''} × daily rental rate</div>
     </div>
     <p style="color:#7a7468;font-size:13px;line-height:1.6">Please return the shoes as soon as possible to stop further charges. Daily charges will continue until the rental is returned, up to the replacement value of the shoes.</p>
-    <p style="color:#7a7468;font-size:12px;line-height:1.6;margin-top:24px">Questions? Reply to this email or contact <a href="mailto:support@beautifullyordered.com" style="color:#b89a5a">support@beautifullyordered.com</a></p>
+    <p style="color:#7a7468;font-size:12px;line-height:1.6;margin-top:24px">Questions? Reply to this email or contact <a href="mailto:support@beautifullyordered.co.uk" style="color:#b89a5a">support@beautifullyordered.co.uk</a></p>
   `)
 );
 
