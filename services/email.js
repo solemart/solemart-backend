@@ -12,22 +12,29 @@ const smtpTransporter = process.env.SMTP_HOST ? nodemailer.createTransport({
   auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
 }) : null;
 
-const FROM = process.env.EMAIL_FROM || 'Kosmos <hello@beautifullyordered.co.uk>';
+const FROM = process.env.EMAIL_FROM || 'Kosmos <hello@updates.beautifullyordered.co.uk>';
 
 const send = async (to, subject, html) => {
   try {
     if (resend) {
-      await resend.emails.send({ from: FROM, to, subject, html });
-      logger.info(`Email sent via Resend to ${to}: ${subject}`);
+      const result = await resend.emails.send({ from: FROM, to, subject, html });
+      if (result.error) {
+        logger.error(`Resend rejected email to ${to}: ${JSON.stringify(result.error)}`);
+        return { ok: false, error: result.error };
+      }
+      logger.info(`Email sent via Resend to ${to}: ${subject} (id=${result.data?.id || 'unknown'})`);
+      return { ok: true, id: result.data?.id };
     } else if (smtpTransporter) {
       await smtpTransporter.sendMail({ from: FROM, to, subject, html });
       logger.info(`Email sent via SMTP to ${to}: ${subject}`);
+      return { ok: true };
     } else {
       logger.warn(`No email provider configured — skipping email to ${to}: ${subject}`);
+      return { ok: false, error: 'No email provider configured' };
     }
   } catch (err) {
-    logger.error(`Email failed to ${to}: ${err.message}`);
-    // Don't throw — allow API to continue even if email fails
+    logger.error(`Email failed to ${to}: ${err.message} ${err.stack || ''}`);
+    return { ok: false, error: err.message };
   }
 };
 
