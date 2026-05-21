@@ -209,10 +209,13 @@ router.post('/checkout', authenticate, async (req, res, next) => {
       if (!shoe) return res.status(404).json({ error: `Shoe ${item.shoe_id} not found` });
       if (shoe.status !== 'listed') return res.status(409).json({ error: `${shoe.brand} ${shoe.model} is not available` });
 
+      // Customer pays the listed price — no extra fees on top.
+      // The 15% platform fee and £8 cleaning fee (rentals) are deducted internally
+      // from the rental income before paying the owner their 85% share.
       const unitPrice = item.order_type === 'rent' ? parseFloat(shoe.rent_price) : parseFloat(shoe.buy_price);
       const subtotal  = item.order_type === 'rent' ? unitPrice * item.rental_days : unitPrice;
+      const total = parseFloat(subtotal.toFixed(2));
       const platformFee = parseFloat((subtotal * 0.15).toFixed(2));
-      const total = parseFloat((subtotal + platformFee).toFixed(2));
       if (item.order_type === 'rent') hasRental = true;
       totalAmount += total;
 
@@ -222,7 +225,7 @@ router.post('/checkout', authenticate, async (req, res, next) => {
           product_data: {
             name: `${shoe.brand} ${shoe.model}`,
             description: item.order_type === 'rent'
-              ? `${item.rental_days}-day rental · UK ${shoe.size}`
+              ? `${item.rental_days}-day rental · UK ${shoe.size} · Free delivery, cleaning & insurance`
               : `Purchase · UK ${shoe.size}`,
           },
           unit_amount: Math.round(total * 100),
@@ -276,14 +279,33 @@ router.post('/checkout', authenticate, async (req, res, next) => {
     const successUrl = `${process.env.APP_URL || 'https://beautifullyordered.com'}?stripe=success&session_id={CHECKOUT_SESSION_ID}`;
     const cancelUrl = `${process.env.APP_URL || 'https://beautifullyordered.com'}?stripe=cancel`;
 
+    // Calculate Connect split — only works for single-shoe carts
+    // (Stripe Checkout Sessions can only split to one connected account per session)
+    let paymentIntentExtras = {};
+    if (orderInputs.length === 1) {
+      const o = orderInputs[0];
+      const { rows: [owner] } = await db.query(`SELECT stripe_account_id FROM users WHERE id = $1`, [o.shoe.owner_id]);
+      if (owner?.stripe_account_id) {
+        const amountPence   = Math.round(o.total * 100);
+        const cleaningPence = o.item.order_type === 'rent' ? 800 : 0;
+        const netPence      = amountPence - cleaningPence;
+        const platformPence = Math.round(netPence * 0.15);
+        const ownerPence    = netPence - platformPence;
+        paymentIntentExtras = {
+          transfer_data: { destination: owner.stripe_account_id, amount: ownerPence },
+          application_fee_amount: platformPence + cleaningPence,
+        };
+      }
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       payment_method_types: ['card'],
       customer: customerId,
       customer_update: { address: 'auto', name: 'auto' },
       line_items: lineItems,
-      // For rentals — save the card for future late fee charges
       payment_intent_data: {
+        ...paymentIntentExtras,
         ...(hasRental ? { setup_future_usage: 'off_session' } : {}),
         metadata: { order_ids: orderIds.join(','), user_id: req.user.id },
       },
