@@ -40,10 +40,14 @@ router.get('/', optionalAuth, async (req, res, next) => {
     }
 
     const sortMap = {
-      newest:     's.listed_at DESC',
-      'price-asc': 'COALESCE(s.rent_price, s.buy_price) ASC',
-      'price-desc':'COALESCE(s.rent_price, s.buy_price) DESC',
-      auth:       's.auth_score DESC NULLS LAST',
+      newest:        's.listed_at DESC',
+      oldest:        's.listed_at ASC',
+      'price-asc':   'COALESCE(s.rent_price, s.buy_price) ASC',
+      'price-desc':  'COALESCE(s.rent_price, s.buy_price) DESC',
+      'rrp-asc':     's.rrp ASC',
+      'rrp-desc':    's.rrp DESC',
+      auth:          's.auth_score DESC NULLS LAST',
+      brand:         's.brand ASC, s.model ASC',
     };
     const orderBy = sortMap[sort] || sortMap.newest;
 
