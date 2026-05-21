@@ -412,7 +412,7 @@ router.post('/orders/:id/refund', requireRole('staff', 'admin'), async (req, res
 
     // Log to activity log
     await db.query(
-      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, details)
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
        VALUES ($1, 'refund_issued', 'order', $2, $3)`,
       [req.user.id, req.params.id, JSON.stringify({ amount, reason })]
     );
@@ -452,7 +452,7 @@ router.post('/orders/:id/credit', requireRole('staff', 'admin'), async (req, res
     );
 
     await db.query(
-      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, details)
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
        VALUES ($1, 'credit_issued', 'order', $2, $3)`,
       [req.user.id, req.params.id, JSON.stringify({ amount, reason })]
     );
@@ -466,7 +466,7 @@ router.post('/orders/:id/flag', requireRole('staff', 'admin'), async (req, res, 
   try {
     const { reason } = req.body;
     await db.query(
-      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, details)
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
        VALUES ($1, 'order_flagged', 'order', $2, $3)`,
       [req.user.id, req.params.id, JSON.stringify({ reason })]
     );
@@ -479,7 +479,7 @@ router.post('/orders/:id/note', requireRole('staff', 'admin'), async (req, res, 
   try {
     const { note } = req.body;
     await db.query(
-      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, details)
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
        VALUES ($1, 'order_note', 'order', $2, $3)`,
       [req.user.id, req.params.id, JSON.stringify({ note })]
     );
@@ -526,7 +526,7 @@ router.patch('/settings/:key', requireRole('admin'), async (req, res, next) => {
 
     // Log activity
     await db.query(
-      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, details)
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
        VALUES ($1, 'setting_updated', 'platform_settings', NULL, $2)`,
       [req.user.id, JSON.stringify({ key: req.params.key, new_value: value })]
     );
