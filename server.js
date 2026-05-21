@@ -26,6 +26,8 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 app.use(helmet({ crossOriginResourcePolicy: false }));
 const allowedOrigins = [
+  'https://beautifullyordered.co.uk',
+  'https://www.beautifullyordered.co.uk',
   'https://beautifullyordered.com',
   'https://www.beautifullyordered.com',
   'https://kosmos.netlify.app',
@@ -38,7 +40,12 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      // Also allow any *.netlify.app preview URL
+      if (/^https:\/\/.*\.netlify\.app$/.test(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS: ' + origin));
+      }
     }
   },
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
