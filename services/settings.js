@@ -36,10 +36,20 @@ async function getMinRentalDays()          { return parseInt(await getSetting('m
 async function getMaxRentalDays()          { return parseInt(await getSetting('max_rental_days', 28)); }
 async function getRentalDefaultDays()      { return parseInt(await getSetting('rental_default_days', 7)); }
 async function getLateFeeGraceHours()      { return parseInt(await getSetting('late_fee_grace_hours', 0)); }
+async function getDeliveryFeeAmount()      { return parseFloat(await getSetting('delivery_fee_amount', 4.99)); }
+async function getFreeDeliveryThreshold()  { return parseFloat(await getSetting('free_delivery_threshold', 50)); }
+
+// Calculate delivery fee for an order subtotal
+async function calculateDeliveryFee(subtotal) {
+  const threshold = await getFreeDeliveryThreshold();
+  if (parseFloat(subtotal) >= threshold) return 0;
+  return await getDeliveryFeeAmount();
+}
 
 module.exports = {
   getSettings, getSetting, invalidateCache,
   getPlatformFeePercent, getCleaningFeeAmount, getOwnerSharePercent,
   getTreasuresMaxPrice, getLateFeeCapMultiplier,
   getMinRentalDays, getMaxRentalDays, getRentalDefaultDays, getLateFeeGraceHours,
+  getDeliveryFeeAmount, getFreeDeliveryThreshold, calculateDeliveryFee,
 };

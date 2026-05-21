@@ -208,6 +208,8 @@ router.post('/checkout', authenticate, async (req, res, next) => {
     const settings = require('../services/settings');
     const platformFeePercent = await settings.getPlatformFeePercent();
     const cleaningFeeAmount  = await settings.getCleaningFeeAmount();
+    const freeDeliveryThreshold = await settings.getFreeDeliveryThreshold();
+    const deliveryFeeAmount = await settings.getDeliveryFeeAmount();
 
     for (const item of items) {
       const { rows: [shoe] } = await db.query(`SELECT * FROM shoes WHERE id = $1`, [item.shoe_id]);
@@ -228,7 +230,7 @@ router.post('/checkout', authenticate, async (req, res, next) => {
           product_data: {
             name: `${shoe.brand} ${shoe.model}`,
             description: item.order_type === 'rent'
-              ? `${item.rental_days}-day rental · UK ${shoe.size} · Free delivery, cleaning & insurance`
+              ? `${item.rental_days}-day rental · UK ${shoe.size} · Cleaning & insurance included`
               : `Purchase · UK ${shoe.size}`,
           },
           unit_amount: Math.round(total * 100),
@@ -237,6 +239,23 @@ router.post('/checkout', authenticate, async (req, res, next) => {
       });
 
       orderInputs.push({ shoe, item, unitPrice, subtotal, platformFee, total });
+    }
+
+    // Add delivery fee as a separate line if the order is below the free threshold
+    const deliveryFee = totalAmount >= freeDeliveryThreshold ? 0 : deliveryFeeAmount;
+    if (deliveryFee > 0) {
+      lineItems.push({
+        price_data: {
+          currency: 'gbp',
+          product_data: {
+            name: 'Delivery',
+            description: `Royal Mail tracked · Free on orders over £${freeDeliveryThreshold.toFixed(0)}`,
+          },
+          unit_amount: Math.round(deliveryFee * 100),
+        },
+        quantity: 1,
+      });
+      totalAmount += deliveryFee;
     }
 
     const { stripe } = require('../services/stripe');
@@ -288,14 +307,16 @@ router.post('/checkout', authenticate, async (req, res, next) => {
       const o = orderInputs[0];
       const { rows: [owner] } = await db.query(`SELECT stripe_account_id FROM users WHERE id = $1`, [o.shoe.owner_id]);
       if (owner?.stripe_account_id) {
-        const amountPence   = Math.round(o.total * 100);
-        const cleaningPence = o.item.order_type === 'rent' ? Math.round(cleaningFeeAmount * 100) : 0;
-        const netPence      = amountPence - cleaningPence;
-        const platformPence = Math.round(netPence * (platformFeePercent / 100));
-        const ownerPence    = netPence - platformPence;
+        const amountPence    = Math.round(o.total * 100);
+        const cleaningPence  = o.item.order_type === 'rent' ? Math.round(cleaningFeeAmount * 100) : 0;
+        const netPence       = amountPence - cleaningPence;
+        const platformPence  = Math.round(netPence * (platformFeePercent / 100));
+        const ownerPence     = netPence - platformPence;
+        const deliveryPence  = Math.round(deliveryFee * 100);
         paymentIntentExtras = {
           transfer_data: { destination: owner.stripe_account_id, amount: ownerPence },
-          application_fee_amount: platformPence + cleaningPence,
+          // Kosmos keeps: platform fee + cleaning + delivery (delivery covers shipping cost)
+          application_fee_amount: platformPence + cleaningPence + deliveryPence,
         };
       }
     }

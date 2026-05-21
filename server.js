@@ -77,7 +77,8 @@ app.get('/api/config', async (req, res) => {
       min_rental_days:         all.min_rental_days,
       max_rental_days:         all.max_rental_days,
       rental_default_days:     all.rental_default_days,
-      free_delivery:           all.free_delivery,
+      delivery_fee_amount:     all.delivery_fee_amount,
+      free_delivery_threshold: all.free_delivery_threshold,
     });
   } catch (e) { res.json({}); }
 });

@@ -8,8 +8,14 @@ async function processLateFees() {
     return;
   }
   const { stripe } = require('./stripe');
+  const settings = require('./settings');
 
-  // Find rentals past their end date that are still active
+  // Load dynamic settings
+  const graceHours = await settings.getLateFeeGraceHours();
+  const capMultiplier = await settings.getLateFeeCapMultiplier();
+  const platformFeePercent = await settings.getPlatformFeePercent();
+
+  // Find rentals past their end date + grace period
   const { rows: lateOrders } = await db.query(`
     SELECT o.*,
            s.brand, s.model, s.owner_id, s.rent_price, s.buy_price,
@@ -21,12 +27,12 @@ async function processLateFees() {
     LEFT JOIN users owner ON owner.id = s.owner_id
     WHERE o.order_type = 'rent'
       AND o.status = 'active_rental'
-      AND o.rental_end_date < NOW()
+      AND o.rental_end_date < (NOW() - ($1 || ' hours')::INTERVAL)
       AND (o.late_fee_paused IS NOT TRUE)
       AND o.stripe_payment_intent_id IS NOT NULL
-  `);
+  `, [graceHours]);
 
-  logger.info(`Late fee job: ${lateOrders.length} overdue rentals to process`);
+  logger.info(`Late fee job: ${lateOrders.length} overdue rentals to process (grace: ${graceHours}h)`);
 
   for (const order of lateOrders) {
     try {
@@ -46,9 +52,9 @@ async function processLateFees() {
       const dailyRate = parseFloat(order.rent_price);
       const lateFeeAmount = dailyRate * fullDaysSince;
 
-      // Cap total late fees at shoe buy_price (replacement value)
+      // Cap total late fees at shoe buy_price × multiplier (replacement value)
       const alreadyCharged = parseFloat(order.late_fees_charged || 0);
-      const maxFee = parseFloat(order.buy_price || order.subtotal * 3);
+      const maxFee = parseFloat(order.buy_price || order.subtotal * 3) * capMultiplier;
       const remainingCap = maxFee - alreadyCharged;
       const finalAmount = Math.min(lateFeeAmount, remainingCap);
 
@@ -96,7 +102,7 @@ async function processLateFees() {
 
       // Split with owner if they have Connect account
       if (order.owner_stripe_id) {
-        const platformFeePence = Math.round(piParams.amount * 0.15);
+        const platformFeePence = Math.round(piParams.amount * (platformFeePercent / 100));
         piParams.transfer_data = { destination: order.owner_stripe_id, amount: piParams.amount - platformFeePence };
         piParams.application_fee_amount = platformFeePence;
       }

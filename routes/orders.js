@@ -109,11 +109,14 @@ router.post('/', authenticate, [
           automatic_payment_methods: { enabled: true },
         };
 
-        // Apply Connect split if owner has Stripe account
+        // Apply Connect split if owner has Stripe account — use dynamic settings
         if (ownerStripeId) {
-          const cleaningFee = order_type === 'rent' ? 800 : 0;
+          const settings = require('../services/settings');
+          const platformFeePercent = await settings.getPlatformFeePercent();
+          const cleaningFeeAmount  = await settings.getCleaningFeeAmount();
+          const cleaningFee = order_type === 'rent' ? Math.round(cleaningFeeAmount * 100) : 0;
           const netAmount = piParams.amount - cleaningFee;
-          const platformFeePence = Math.round(netAmount * 0.15);
+          const platformFeePence = Math.round(netAmount * (platformFeePercent / 100));
           piParams.transfer_data = { destination: ownerStripeId, amount: netAmount - platformFeePence };
           piParams.application_fee_amount = platformFeePence + cleaningFee;
         }
