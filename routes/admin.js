@@ -487,4 +487,52 @@ router.post('/orders/:id/note', requireRole('staff', 'admin'), async (req, res, 
   } catch (err) { next(err); }
 });
 
+// ── PLATFORM SETTINGS ─────────────────────────────────────────────────────────
+router.get('/settings', requireRole('admin'), async (req, res, next) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT key, value, description, updated_at FROM platform_settings ORDER BY key`
+    );
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
+router.patch('/settings/:key', requireRole('admin'), async (req, res, next) => {
+  try {
+    const { value } = req.body;
+    if (value === undefined) return res.status(400).json({ error: 'value is required' });
+
+    // Auto-calculate owner_share_percent when platform_fee_percent changes
+    if (req.params.key === 'platform_fee_percent') {
+      const pct = parseFloat(value);
+      if (pct < 0 || pct > 100) return res.status(400).json({ error: 'Must be 0-100' });
+      await db.query(
+        `UPDATE platform_settings SET value = $1::jsonb, updated_by = $2, updated_at = NOW() WHERE key = 'owner_share_percent'`,
+        [JSON.stringify(100 - pct), req.user.id]
+      );
+    }
+
+    const { rows } = await db.query(
+      `UPDATE platform_settings SET value = $1::jsonb, updated_by = $2, updated_at = NOW()
+       WHERE key = $3 RETURNING *`,
+      [JSON.stringify(value), req.user.id, req.params.key]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Setting not found' });
+
+    // Invalidate cache
+    const settings = require('../services/settings');
+    settings.invalidateCache();
+
+    // Log activity
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, details)
+       VALUES ($1, 'setting_updated', 'platform_settings', NULL, $2)`,
+      [req.user.id, JSON.stringify({ key: req.params.key, new_value: value })]
+    );
+
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
 module.exports = router;

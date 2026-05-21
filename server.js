@@ -56,6 +56,24 @@ const authLimiter = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error:
 app.use('/api', globalLimiter);
 app.use('/api/auth', authLimiter);
 app.get('/health', (req, res) => { res.json({ status: 'ok', env: process.env.NODE_ENV, ts: new Date().toISOString() }); });
+
+// Public — non-sensitive settings the frontend uses for display
+app.get('/api/config', async (req, res) => {
+  try {
+    const settings = require('./services/settings');
+    const all = await settings.getSettings();
+    res.json({
+      platform_fee_percent:    all.platform_fee_percent,
+      cleaning_fee_amount:     all.cleaning_fee_amount,
+      owner_share_percent:     all.owner_share_percent,
+      treasures_max_price:     all.treasures_max_price,
+      min_rental_days:         all.min_rental_days,
+      max_rental_days:         all.max_rental_days,
+      rental_default_days:     all.rental_default_days,
+      free_delivery:           all.free_delivery,
+    });
+  } catch (e) { res.json({}); }
+});
 app.use('/api/auth',        authRoutes);
 app.use('/api/users',       userRoutes);
 app.use('/api/shoes',       shoeRoutes);

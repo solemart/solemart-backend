@@ -204,18 +204,21 @@ router.post('/checkout', authenticate, async (req, res, next) => {
     const orderInputs = [];
     let hasRental = false;
 
+    // Load platform settings (cached)
+    const settings = require('../services/settings');
+    const platformFeePercent = await settings.getPlatformFeePercent();
+    const cleaningFeeAmount  = await settings.getCleaningFeeAmount();
+
     for (const item of items) {
       const { rows: [shoe] } = await db.query(`SELECT * FROM shoes WHERE id = $1`, [item.shoe_id]);
       if (!shoe) return res.status(404).json({ error: `Shoe ${item.shoe_id} not found` });
       if (shoe.status !== 'listed') return res.status(409).json({ error: `${shoe.brand} ${shoe.model} is not available` });
 
-      // Customer pays the listed price — no extra fees on top.
-      // The 15% platform fee and £8 cleaning fee (rentals) are deducted internally
-      // from the rental income before paying the owner their 85% share.
+      // Customer pays the listed price — no extras on top.
       const unitPrice = item.order_type === 'rent' ? parseFloat(shoe.rent_price) : parseFloat(shoe.buy_price);
       const subtotal  = item.order_type === 'rent' ? unitPrice * item.rental_days : unitPrice;
       const total = parseFloat(subtotal.toFixed(2));
-      const platformFee = parseFloat((subtotal * 0.15).toFixed(2));
+      const platformFee = parseFloat((subtotal * (platformFeePercent / 100)).toFixed(2));
       if (item.order_type === 'rent') hasRental = true;
       totalAmount += total;
 
@@ -280,16 +283,15 @@ router.post('/checkout', authenticate, async (req, res, next) => {
     const cancelUrl = `${process.env.APP_URL || 'https://beautifullyordered.com'}?stripe=cancel`;
 
     // Calculate Connect split — only works for single-shoe carts
-    // (Stripe Checkout Sessions can only split to one connected account per session)
     let paymentIntentExtras = {};
     if (orderInputs.length === 1) {
       const o = orderInputs[0];
       const { rows: [owner] } = await db.query(`SELECT stripe_account_id FROM users WHERE id = $1`, [o.shoe.owner_id]);
       if (owner?.stripe_account_id) {
         const amountPence   = Math.round(o.total * 100);
-        const cleaningPence = o.item.order_type === 'rent' ? 800 : 0;
+        const cleaningPence = o.item.order_type === 'rent' ? Math.round(cleaningFeeAmount * 100) : 0;
         const netPence      = amountPence - cleaningPence;
-        const platformPence = Math.round(netPence * 0.15);
+        const platformPence = Math.round(netPence * (platformFeePercent / 100));
         const ownerPence    = netPence - platformPence;
         paymentIntentExtras = {
           transfer_data: { destination: owner.stripe_account_id, amount: ownerPence },
