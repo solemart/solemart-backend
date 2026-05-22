@@ -224,4 +224,35 @@ router.post('/:id/delist', authenticate, async (req, res, next) => {
   }
 });
 
+// POST /api/shoes/:id/request-back — owner requests their shoe back
+router.post('/:id/request-back', authenticate, async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+    const { rows: [shoe] } = await db.query(
+      `SELECT * FROM shoes WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!shoe) return res.status(404).json({ error: 'Shoe not found' });
+    if (shoe.owner_id !== req.user.id) return res.status(403).json({ error: 'Not your shoe' });
+    if (!['listed','authenticating','cleaning'].includes(shoe.status)) {
+      return res.status(409).json({ error: `Cannot request back — shoe is currently ${shoe.status.replace(/_/g, ' ')}` });
+    }
+
+    // Move to return_requested status
+    await db.query(
+      `UPDATE shoes SET status = 'return_requested', updated_at = NOW() WHERE id = $1`,
+      [req.params.id]
+    );
+
+    // Log activity
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, 'owner_requested_back', 'shoe', $2, $3)`,
+      [req.user.id, req.params.id, JSON.stringify({ reason: reason || '', shoe: `${shoe.brand} ${shoe.model}` })]
+    );
+
+    res.json({ ok: true, message: 'Return request submitted — admin will arrange collection.' });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
