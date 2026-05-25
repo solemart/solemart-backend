@@ -5,6 +5,50 @@ const { authenticate, requireRole, optionalAuth } = require('../middleware/auth'
 const { logActivity } = require('../services/activityLog');
 const router  = express.Router();
 
+// ── GET /api/shoes/edit ──────────────────────────────────────
+// Returns the current week's Edit (auto-curates if missing)
+router.get('/edit', async (req, res, next) => {
+  try {
+    const theEdit = require('../services/theEdit');
+    const edit = await theEdit.getCurrentEdit();
+    if (!edit.shoe_ids || !edit.shoe_ids.length) {
+      return res.json({ shoes: [], week_start: edit.week_start, next_refresh: edit.next_refresh });
+    }
+
+    const { rows } = await db.query(`
+      SELECT s.id, s.brand, s.model, s.size, s.colour, s.category, s.gender,
+             s.condition, s.assessed_wear_grade, s.auth_grade,
+             s.rrp, s.rent_price, s.buy_price, s.listing_type,
+             s.emoji, s.shoe_code, s.status,
+             s.listed_at
+      FROM shoes s
+      WHERE s.id = ANY($1::uuid[])
+        AND s.status = 'listed'
+    `, [edit.shoe_ids]);
+
+    // Preserve curated order + add category tag (best/newest/popular)
+    const byId = {};
+    rows.forEach(r => { byId[r.id] = r; });
+    const ordered = [];
+    if (edit.breakdown) {
+      ['best','newest','popular'].forEach(cat => {
+        (edit.breakdown[cat] || []).forEach(id => {
+          if (byId[id]) ordered.push({ ...byId[id], edit_category: cat });
+        });
+      });
+    } else {
+      edit.shoe_ids.forEach(id => { if (byId[id]) ordered.push(byId[id]); });
+    }
+
+    res.json({
+      shoes: ordered,
+      week_start: edit.week_start,
+      next_refresh: edit.next_refresh,
+      published_at: edit.published_at,
+    });
+  } catch (err) { next(err); }
+});
+
 // ── GET /api/shoes  (public browse) ──────────────────────────
 router.get('/', optionalAuth, async (req, res, next) => {
   try {
@@ -113,6 +157,12 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     );
 
     if (!rows.length) return res.status(404).json({ error: 'Shoe not found' });
+
+    // Fire-and-forget view count increment (for "popular" curation)
+    db.query(
+      `UPDATE shoes SET view_count = COALESCE(view_count, 0) + 1, last_viewed_at = NOW() WHERE id = $1`,
+      [req.params.id]
+    ).catch(() => {});
 
     // Fetch photos
     const photos = await db.query(
@@ -252,6 +302,26 @@ router.post('/:id/request-back', authenticate, async (req, res, next) => {
     );
 
     res.json({ ok: true, message: 'Return request submitted — admin will arrange collection.' });
+  } catch (err) { next(err); }
+});
+
+// GET /api/shoes/:id/timeline — owner-visible submission lifecycle
+router.get('/:id/timeline', authenticate, async (req, res, next) => {
+  try {
+    const { rows: [shoe] } = await db.query(`SELECT owner_id FROM shoes WHERE id = $1`, [req.params.id]);
+    if (!shoe) return res.status(404).json({ error: 'Shoe not found' });
+    // Only owner or admin can view
+    if (shoe.owner_id !== req.user.id && !['admin','staff'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Not authorised' });
+    }
+    const events = require('../services/submissionEvents');
+    const timeline = await events.getTimeline(req.params.id);
+    // Filter out admin-internal notes for owners
+    const filtered = req.user.role === 'admin' || req.user.role === 'staff'
+      ? timeline
+      : timeline.filter(e => e.event_type !== 'internal_note' &&
+                              !(e.meta && e.meta.visible_to_owner === false));
+    res.json(filtered);
   } catch (err) { next(err); }
 });
 

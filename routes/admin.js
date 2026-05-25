@@ -39,12 +39,19 @@ router.get('/queue', async (req, res, next) => {
   try {
     const { stage } = req.query; // authenticating | cleaning | submitted | all
 
-    let where = `s.status NOT IN ('listed','sold','returned_to_owner','rejected')`;
-    if (stage && stage !== 'all') where += ` AND s.status = '${stage}'`;
+    // Submissions = anything pre-listing (not yet on the catalogue)
+    // Once listed/sold/returned, it's NOT a submission anymore.
+    let where = `s.status IN ('submitted','in_transit','authenticating','cleaning','rejected')`;
+    if (stage && stage !== 'all') where = `s.status = '${stage}'`;
 
     const { rows } = await db.query(
       `SELECT s.*, u.first_name, u.last_name, u.email,
-              ls.reference AS submission_ref, ls.collection_postcode
+              ls.reference AS submission_ref, ls.collection_postcode,
+              COALESCE(
+                (SELECT json_agg(json_build_object('url', sp.url, 'caption', sp.caption) ORDER BY sp.sort_order)
+                 FROM shoe_photos sp WHERE sp.shoe_id = s.id),
+                '[]'::json
+              ) AS owner_photos
        FROM shoes s
        JOIN users u ON u.id = s.owner_id
        LEFT JOIN submission_shoes ss ON ss.shoe_id = s.id
@@ -315,16 +322,99 @@ router.patch('/payouts/:id', requireRole('staff', 'admin'), async (req, res, nex
 // ── SHOES ADMIN PATCH ──────────────────────────────────────────────────────────
 router.patch('/shoes/:id', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
-    const allowed = ['status','assessed_wear_grade','rejection_reason','auth_grade','auth_score'];
+    const allowed = ['status','assessed_wear_grade','rejection_reason','auth_grade','auth_score',
+                     'brand','model','size','colour','category','gender','condition',
+                     'rrp','rent_price','buy_price','listing_type','emoji','description',
+                     'library_photo_id'];
     const updates = Object.entries(req.body).filter(([k]) => allowed.includes(k));
     if (!updates.length) return res.status(400).json({ error: 'No valid fields' });
+
+    // Get current shoe state
+    const { rows: [before] } = await db.query(`SELECT * FROM shoes WHERE id = $1`, [req.params.id]);
+    if (!before) return res.status(404).json({ error: 'Shoe not found' });
+
+    // Generate a KSM code on first listing if missing
+    let extraUpdate = '';
+    let extraValues = [];
+    const newStatus = req.body.status;
+    if (newStatus === 'listed' && !before.shoe_code) {
+      const { generateUniqueShoeCode } = require('../services/shoeCodes');
+      const code = await generateUniqueShoeCode(req.body.brand || before.brand);
+      extraUpdate = ', shoe_code = $' + (updates.length + 2);
+      extraValues.push(code);
+    }
+    // Set listed_at timestamp when transitioning to listed
+    if (newStatus === 'listed' && before.status !== 'listed') {
+      extraUpdate += ', listed_at = NOW()';
+    }
+
     const setClauses = updates.map(([k], i) => `${k}=$${i+2}`).join(',');
     const values = updates.map(([,v]) => v);
     const { rows } = await db.query(
-      `UPDATE shoes SET ${setClauses}, updated_at=NOW() WHERE id=$1 RETURNING *`,
-      [req.params.id, ...values]
+      `UPDATE shoes SET ${setClauses}${extraUpdate}, updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [req.params.id, ...values, ...extraValues]
     );
+
+    // Log to submission events timeline (visible to owner)
+    const events = require('../services/submissionEvents');
+    let eventType = 'updated';
+    if (newStatus && newStatus !== before.status) {
+      if (newStatus === 'listed')             eventType = 'listed';
+      else if (newStatus === 'rejected')      eventType = 'rejected';
+      else if (newStatus === 'authenticating') eventType = 'review_started';
+      else if (newStatus === 'cleaning')      eventType = 'cleaning_started';
+      else if (newStatus === 'in_transit')    eventType = 'collected';
+      else                                    eventType = 'status_changed';
+    }
+    await events.logEvent({
+      shoeId: req.params.id,
+      eventType,
+      statusBefore: before.status,
+      statusAfter: rows[0].status,
+      actorId: req.user.id,
+      actorRole: 'kosmos',
+      notes: req.body.rejection_reason || req.body.note || null,
+      meta: req.body,
+    });
+
+    // Activity log (admin audit)
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, $2, 'shoe', $3, $4)`,
+      [req.user.id, eventType, req.params.id, JSON.stringify({ brand: before.brand, model: before.model, ...req.body })]
+    );
+
     res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
+// POST /api/admin/shoes/:id/note — add an internal/owner-visible note
+router.post('/shoes/:id/note', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { note, visible_to_owner } = req.body;
+    if (!note) return res.status(400).json({ error: 'Note required' });
+    const { rows: [shoe] } = await db.query(`SELECT id, status FROM shoes WHERE id = $1`, [req.params.id]);
+    if (!shoe) return res.status(404).json({ error: 'Shoe not found' });
+
+    const events = require('../services/submissionEvents');
+    await events.logEvent({
+      shoeId: req.params.id,
+      eventType: visible_to_owner === false ? 'internal_note' : 'note_added',
+      statusBefore: shoe.status,
+      statusAfter: shoe.status,
+      actorId: req.user.id,
+      actorRole: 'kosmos',
+      notes: note,
+      meta: { visible_to_owner: visible_to_owner !== false },
+    });
+
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, 'note_added', 'shoe', $2, $3)`,
+      [req.user.id, req.params.id, JSON.stringify({ note, visible_to_owner: visible_to_owner !== false })]
+    );
+
+    res.json({ ok: true });
   } catch (err) { next(err); }
 });
 
@@ -689,106 +779,166 @@ router.get('/reports/:type/pdf', requireRole('admin'), async (req, res, next) =>
     const toDate   = to   ? new Date(to)   : new Date();
     const periodLabel = `${fromDate.toLocaleDateString('en-GB')} – ${toDate.toLocaleDateString('en-GB')}`;
 
-    const doc = new PDFDocument({ size: 'A4', margin: 40, info: { Title: `Kosmos ${type} report`, Author: 'Beautifully Ordered Ltd' } });
+    const doc = new PDFDocument({
+      size: 'A4',
+      margins: { top: 50, bottom: 60, left: 50, right: 50 },
+      info: { Title: `Kosmos ${type} report`, Author: 'Beautifully Ordered Ltd' },
+      bufferPages: true,
+    });
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="kosmos-${type}-${fromDate.toISOString().slice(0,10)}.pdf"`);
     doc.pipe(res);
 
-    // ── Header ───────────────────────────────────────────────────────────
-    doc.fontSize(22).fillColor('#0f0e0c').font('Helvetica-Bold').text('KOSMOS', { align: 'left' });
-    doc.fontSize(9).fillColor('#b89a5a').font('Helvetica').text('BEAUTIFULLY ORDERED', { characterSpacing: 3 });
-    doc.moveDown(0.5);
-    doc.fontSize(16).fillColor('#0f0e0c').font('Helvetica-Bold').text(`${type.replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase())} Report`);
-    doc.fontSize(10).fillColor('#7a7468').font('Helvetica').text(`Period: ${periodLabel}`);
-    doc.fontSize(8).fillColor('#a09a8e').text(`Generated: ${new Date().toLocaleString('en-GB')} · Beautifully Ordered Ltd · Co. No. 17231554`);
-    doc.moveTo(40, doc.y + 8).lineTo(555, doc.y + 8).strokeColor('#e0d8c8').stroke();
-    doc.moveDown(1.5);
+    const PAGE_LEFT = 50;
+    const PAGE_RIGHT = 545;
+    const PAGE_WIDTH = PAGE_RIGHT - PAGE_LEFT;
+    const COL_GOLD = '#b89a5a';
+    const COL_INK = '#0f0e0c';
+    const COL_MUTED = '#7a7468';
+    const COL_FAINT = '#a09a8e';
+    const COL_RULE = '#e0d8c8';
+    const COL_CREAM = '#faf6ed';
 
-    // ── Body by report type ──────────────────────────────────────────────
+    // ── HEADER ─────────────────────────────────────────────────────────
+    doc.fontSize(24).fillColor(COL_INK).font('Helvetica-Bold').text('KOSMOS', PAGE_LEFT, 50);
+    doc.fontSize(8).fillColor(COL_GOLD).font('Helvetica').text('BEAUTIFULLY ORDERED', PAGE_LEFT, 78, { characterSpacing: 3 });
+
+    // Report title and period on right
+    const reportTitle = type.replace(/-/g,' ').replace(/\b\w/g, c => c.toUpperCase());
+    doc.fontSize(11).fillColor(COL_MUTED).font('Helvetica').text(reportTitle.toUpperCase(), PAGE_LEFT, 50, { width: PAGE_WIDTH, align: 'right', characterSpacing: 2 });
+    doc.fontSize(16).fillColor(COL_INK).font('Helvetica-Bold').text('Report', PAGE_LEFT, 65, { width: PAGE_WIDTH, align: 'right' });
+    doc.fontSize(9).fillColor(COL_MUTED).font('Helvetica').text(periodLabel, PAGE_LEFT, 86, { width: PAGE_WIDTH, align: 'right' });
+
+    // Divider line
+    doc.moveTo(PAGE_LEFT, 110).lineTo(PAGE_RIGHT, 110).lineWidth(0.5).strokeColor(COL_GOLD).stroke();
+
+    doc.y = 130;
+
+    // ── HELPERS ────────────────────────────────────────────────────────
+    function sectionTitle(text) {
+      if (doc.y > 720) doc.addPage();
+      doc.fontSize(8).fillColor(COL_GOLD).font('Helvetica-Bold').text(text.toUpperCase(), PAGE_LEFT, doc.y, { characterSpacing: 2 });
+      doc.moveTo(PAGE_LEFT, doc.y + 4).lineTo(PAGE_LEFT + 30, doc.y + 4).lineWidth(1).strokeColor(COL_GOLD).stroke();
+      doc.moveDown(1);
+    }
+
+    function statCard(x, y, w, h, label, value, valueColor) {
+      doc.rect(x, y, w, h).fillColor(COL_CREAM).fill();
+      doc.fontSize(7).fillColor(COL_FAINT).font('Helvetica-Bold').text(label, x + 10, y + 10, { width: w - 20, characterSpacing: 1.5 });
+      doc.fontSize(18).fillColor(valueColor || COL_INK).font('Helvetica-Bold').text(String(value), x + 10, y + 24, { width: w - 20 });
+    }
+
+    function keyValueRow(key, value, bold) {
+      if (doc.y > 770) doc.addPage();
+      const startY = doc.y;
+      doc.fontSize(10).fillColor(COL_MUTED).font('Helvetica').text(key, PAGE_LEFT, startY, { width: PAGE_WIDTH * 0.6 });
+      doc.fontSize(10).fillColor(COL_INK).font(bold ? 'Helvetica-Bold' : 'Helvetica').text(String(value), PAGE_LEFT, startY, { width: PAGE_WIDTH, align: 'right' });
+      doc.y = startY + 16;
+    }
+
+    function tableHeader(cols, widths) {
+      if (doc.y > 720) doc.addPage();
+      doc.rect(PAGE_LEFT, doc.y, PAGE_WIDTH, 20).fillColor(COL_CREAM).fill();
+      let x = PAGE_LEFT + 8;
+      doc.fontSize(8).fillColor(COL_MUTED).font('Helvetica-Bold');
+      cols.forEach((c, i) => {
+        doc.text(c, x, doc.y + 6, { width: widths[i] - 8, characterSpacing: 1 });
+        x += widths[i];
+      });
+      doc.y += 22;
+    }
+
+    function tableRow(cells, widths, isAlt) {
+      if (doc.y > 770) doc.addPage();
+      if (isAlt) {
+        doc.rect(PAGE_LEFT, doc.y - 2, PAGE_WIDTH, 16).fillColor('#fafafa').fill();
+      }
+      let x = PAGE_LEFT + 8;
+      doc.fontSize(9).fillColor(COL_INK).font('Helvetica');
+      cells.forEach((cell, i) => {
+        const str = String(cell || '—').slice(0, Math.floor((widths[i] - 8) / 5));
+        doc.text(str, x, doc.y + 2, { width: widths[i] - 8 });
+        x += widths[i];
+      });
+      doc.y += 16;
+    }
+
+    // ── BODY: REVENUE SUMMARY ──────────────────────────────────────────
     if (type === 'revenue-summary') {
-      const { rows: summary } = await db.query(`
+      const { rows: [s] } = await db.query(`
         SELECT
           COUNT(*) AS orders,
-          SUM(CASE WHEN o.order_type='rent' THEN 1 ELSE 0 END) AS rentals,
-          SUM(CASE WHEN o.order_type='buy'  THEN 1 ELSE 0 END) AS sales,
-          COALESCE(SUM(o.total), 0) AS gmv,
-          COALESCE(SUM(o.platform_fee), 0) AS platform_rev,
-          COALESCE(SUM(o.late_fees_charged), 0) AS late_fees
-        FROM orders o
-        WHERE o.created_at BETWEEN $1 AND $2
-          AND o.status NOT IN ('cancelled','refunded','pending_payment')
+          SUM(CASE WHEN order_type='rent' THEN 1 ELSE 0 END) AS rentals,
+          SUM(CASE WHEN order_type='buy'  THEN 1 ELSE 0 END) AS sales,
+          COALESCE(SUM(total), 0) AS gmv,
+          COALESCE(SUM(platform_fee), 0) AS platform_rev,
+          COALESCE(SUM(late_fees_charged), 0) AS late_fees,
+          COALESCE(AVG(total), 0) AS aov
+        FROM orders
+        WHERE created_at BETWEEN $1 AND $2
+          AND status NOT IN ('cancelled','refunded','pending_payment')
       `, [fromDate, toDate]);
-      const s = summary[0] || {};
 
-      // Big summary boxes
-      const stats = [
-        { label: 'TOTAL GMV',       value: `£${parseFloat(s.gmv||0).toFixed(2)}`,        color: '#0f0e0c' },
-        { label: 'PLATFORM REVENUE', value: `£${parseFloat(s.platform_rev||0).toFixed(2)}`, color: '#b89a5a' },
-        { label: 'ORDERS',          value: parseInt(s.orders||0),                       color: '#0f0e0c' },
-        { label: 'LATE FEES',        value: `£${parseFloat(s.late_fees||0).toFixed(2)}`,  color: '#0f0e0c' },
-      ];
-      let x = 40;
-      stats.forEach(stat => {
-        doc.rect(x, doc.y, 120, 60).strokeColor('#e0d8c8').stroke();
-        doc.fontSize(8).fillColor('#a09a8e').text(stat.label, x + 10, doc.y + 8, { width: 100, characterSpacing: 1 });
-        doc.fontSize(16).fillColor(stat.color).font('Helvetica-Bold').text(String(stat.value), x + 10, doc.y + 4, { width: 100 });
-        doc.font('Helvetica');
-        x += 130;
-      });
-      doc.y += 70;
-      doc.moveDown(1);
+      // ─── Headline metrics ───
+      sectionTitle('Headline Metrics');
+      const cardW = (PAGE_WIDTH - 30) / 4;
+      const cardY = doc.y;
+      statCard(PAGE_LEFT,                        cardY, cardW, 60, 'TOTAL GMV',        '£' + parseFloat(s.gmv||0).toFixed(2), COL_INK);
+      statCard(PAGE_LEFT + cardW + 10,            cardY, cardW, 60, 'PLATFORM REVENUE', '£' + parseFloat(s.platform_rev||0).toFixed(2), COL_GOLD);
+      statCard(PAGE_LEFT + (cardW + 10) * 2,       cardY, cardW, 60, 'ORDERS',           parseInt(s.orders||0), COL_INK);
+      statCard(PAGE_LEFT + (cardW + 10) * 3,       cardY, cardW, 60, 'AVG ORDER VALUE',  '£' + parseFloat(s.aov||0).toFixed(2), COL_INK);
+      doc.y = cardY + 80;
 
-      // Breakdown table
-      doc.fontSize(11).fillColor('#0f0e0c').font('Helvetica-Bold').text('Breakdown');
+      // ─── Breakdown ───
+      sectionTitle('Order Breakdown');
+      keyValueRow('Rental orders',   parseInt(s.rentals || 0));
+      keyValueRow('Sale orders',     parseInt(s.sales || 0));
+      keyValueRow('Total orders',    parseInt(s.orders || 0), true);
       doc.moveDown(0.5);
-      const breakdown = [
-        ['Rentals',  parseInt(s.rentals || 0)],
-        ['Sales',    parseInt(s.sales || 0)],
-        ['Total GMV', `£${parseFloat(s.gmv || 0).toFixed(2)}`],
-        ['Platform fees (15%)', `£${parseFloat(s.platform_rev || 0).toFixed(2)}`],
-        ['Late fees charged',   `£${parseFloat(s.late_fees || 0).toFixed(2)}`],
-      ];
-      doc.fontSize(10).font('Helvetica');
-      breakdown.forEach(([k, v]) => {
-        doc.fillColor('#7a7468').text(k, 40, doc.y, { continued: true });
-        doc.fillColor('#0f0e0c').font('Helvetica-Bold').text(String(v), { align: 'right' });
-        doc.font('Helvetica');
-      });
 
-      // Per-day mini table
-      doc.moveDown(1.5);
+      // ─── Revenue split ───
+      sectionTitle('Revenue Split');
+      const gmv = parseFloat(s.gmv || 0);
+      const plat = parseFloat(s.platform_rev || 0);
+      const late = parseFloat(s.late_fees || 0);
+      const ownersPaid = gmv - plat;
+      keyValueRow('Gross Merchandise Value (GMV)', '£' + gmv.toFixed(2));
+      keyValueRow('Paid to owners (85% net of cleaning)', '£' + ownersPaid.toFixed(2));
+      keyValueRow('Kosmos platform fee (15%)', '£' + plat.toFixed(2));
+      keyValueRow('Late fees charged', '£' + late.toFixed(2));
+      keyValueRow('Total Kosmos revenue', '£' + (plat + late).toFixed(2), true);
+      doc.moveDown(0.5);
+
+      // ─── Daily activity table ───
       const { rows: daily } = await db.query(`
-        SELECT DATE(created_at) AS date, COUNT(*) AS orders, COALESCE(SUM(total),0) AS gmv, COALESCE(SUM(platform_fee),0) AS rev
+        SELECT DATE(created_at) AS date, COUNT(*) AS orders,
+               COALESCE(SUM(total),0) AS gmv, COALESCE(SUM(platform_fee),0) AS rev
         FROM orders WHERE created_at BETWEEN $1 AND $2
           AND status NOT IN ('cancelled','refunded','pending_payment')
         GROUP BY DATE(created_at) ORDER BY DATE(created_at) DESC LIMIT 30
       `, [fromDate, toDate]);
 
       if (daily.length) {
-        doc.fontSize(11).fillColor('#0f0e0c').font('Helvetica-Bold').text('Daily Activity (last 30 days)');
-        doc.moveDown(0.5);
-        doc.fontSize(9).fillColor('#a09a8e').font('Helvetica-Bold');
-        doc.text('Date',        40,  doc.y, { continued: true, width: 120 });
-        doc.text('Orders',      160, doc.y, { continued: true, width: 80 });
-        doc.text('GMV',         240, doc.y, { continued: true, width: 100 });
-        doc.text('Platform Rev', 340, doc.y);
-        doc.moveTo(40, doc.y + 4).lineTo(555, doc.y + 4).stroke('#e0d8c8');
-        doc.moveDown(0.5);
-        doc.font('Helvetica').fillColor('#0f0e0c');
-        daily.forEach(d => {
-          doc.text(new Date(d.date).toLocaleDateString('en-GB'), 40, doc.y, { continued: true, width: 120 });
-          doc.text(d.orders, 160, doc.y, { continued: true, width: 80 });
-          doc.text(`£${parseFloat(d.gmv).toFixed(2)}`, 240, doc.y, { continued: true, width: 100 });
-          doc.text(`£${parseFloat(d.rev).toFixed(2)}`, 340, doc.y);
+        sectionTitle('Daily Activity (last 30 days)');
+        tableHeader(['Date', 'Orders', 'GMV', 'Platform Revenue'], [180, 100, 130, 135]);
+        daily.forEach((d, i) => {
+          tableRow([
+            new Date(d.date).toLocaleDateString('en-GB', { day:'numeric', month:'short', year:'numeric' }),
+            d.orders,
+            '£' + parseFloat(d.gmv).toFixed(2),
+            '£' + parseFloat(d.rev).toFixed(2),
+          ], [180, 100, 130, 135], i % 2 === 1);
         });
       }
     }
 
+    // ── BODY: ORDERS ───────────────────────────────────────────────────
     else if (type === 'orders') {
-      const { rows } = await db.query(`
+      const { rows: orders } = await db.query(`
         SELECT o.reference, o.created_at, o.order_type, o.status, o.total, o.platform_fee,
                s.brand, s.model, s.shoe_code,
-               u.email AS customer_email
+               u.email AS customer_email,
+               u.first_name || ' ' || u.last_name AS customer_name
         FROM orders o
         LEFT JOIN shoes s ON s.id = o.shoe_id
         LEFT JOIN users u ON u.id = o.customer_id
@@ -796,71 +946,99 @@ router.get('/reports/:type/pdf', requireRole('admin'), async (req, res, next) =>
         ORDER BY o.created_at DESC LIMIT 200
       `, [fromDate, toDate]);
 
-      doc.fontSize(10).fillColor('#7a7468').text(`${rows.length} orders shown (max 200 — download CSV for full data)`);
-      doc.moveDown(1);
-      doc.fontSize(8).fillColor('#a09a8e').font('Helvetica-Bold');
-      doc.text('Ref',      40,  doc.y, { continued: true, width: 70 });
-      doc.text('Date',     110, doc.y, { continued: true, width: 70 });
-      doc.text('Type',     180, doc.y, { continued: true, width: 40 });
-      doc.text('Shoe',     220, doc.y, { continued: true, width: 180 });
-      doc.text('Total',    400, doc.y, { continued: true, width: 60 });
-      doc.text('Status',   460, doc.y);
-      doc.moveTo(40, doc.y + 4).lineTo(555, doc.y + 4).stroke('#e0d8c8');
-      doc.moveDown(0.5);
-      doc.font('Helvetica').fillColor('#0f0e0c').fontSize(8);
-      rows.forEach(r => {
-        if (doc.y > 770) { doc.addPage(); }
-        doc.text(r.reference || '—', 40, doc.y, { continued: true, width: 70 });
-        doc.text(new Date(r.created_at).toLocaleDateString('en-GB'), 110, doc.y, { continued: true, width: 70 });
-        doc.text(r.order_type, 180, doc.y, { continued: true, width: 40 });
-        doc.text(`${r.brand||''} ${r.model||''}`.slice(0, 26), 220, doc.y, { continued: true, width: 180 });
-        doc.text(`£${parseFloat(r.total||0).toFixed(2)}`, 400, doc.y, { continued: true, width: 60 });
-        doc.text(r.status, 460, doc.y);
+      // Summary first
+      const total = orders.reduce((a, o) => a + parseFloat(o.total || 0), 0);
+      const fees = orders.reduce((a, o) => a + parseFloat(o.platform_fee || 0), 0);
+      sectionTitle('Summary');
+      const cardW = (PAGE_WIDTH - 20) / 3;
+      const cardY = doc.y;
+      statCard(PAGE_LEFT,                cardY, cardW, 60, 'ORDERS',          orders.length, COL_INK);
+      statCard(PAGE_LEFT + cardW + 10,    cardY, cardW, 60, 'TOTAL VALUE',     '£' + total.toFixed(2), COL_INK);
+      statCard(PAGE_LEFT + (cardW + 10)*2, cardY, cardW, 60, 'PLATFORM REVENUE', '£' + fees.toFixed(2), COL_GOLD);
+      doc.y = cardY + 80;
+
+      // Orders table
+      sectionTitle(`Orders (${orders.length})`);
+      tableHeader(['Reference', 'Date', 'Type', 'Customer', 'Shoe', 'Total'], [80, 70, 40, 110, 145, 50]);
+      orders.forEach((o, i) => {
+        tableRow([
+          o.reference || '—',
+          new Date(o.created_at).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}),
+          o.order_type,
+          (o.customer_name || o.customer_email || '—').slice(0, 18),
+          `${o.brand || ''} ${o.model || ''}`.slice(0, 24),
+          '£' + parseFloat(o.total || 0).toFixed(2),
+        ], [80, 70, 40, 110, 145, 50], i % 2 === 1);
       });
+      if (orders.length === 200) {
+        doc.moveDown(0.5);
+        doc.fontSize(8).fillColor(COL_FAINT).text('Showing first 200 orders — download CSV for full data', PAGE_LEFT, doc.y);
+      }
     }
 
+    // ── BODY: SHOES ────────────────────────────────────────────────────
     else if (type === 'shoes') {
-      const { rows } = await db.query(`
-        SELECT shoe_code, brand, model, size, rent_price, buy_price, rrp, status, listed_at
-        FROM shoes WHERE created_at BETWEEN $1 AND $2 ORDER BY created_at DESC LIMIT 200
+      const { rows: shoes } = await db.query(`
+        SELECT shoe_code, brand, model, size, colour, rent_price, buy_price, rrp, status, listed_at,
+               (SELECT first_name || ' ' || last_name FROM users WHERE id = shoes.owner_id) AS owner_name
+        FROM shoes
+        WHERE created_at BETWEEN $1 AND $2
+        ORDER BY created_at DESC LIMIT 200
       `, [fromDate, toDate]);
 
-      doc.fontSize(10).fillColor('#7a7468').text(`${rows.length} shoes shown (max 200 — download CSV for full data)`);
-      doc.moveDown(1);
-      doc.fontSize(8).fillColor('#a09a8e').font('Helvetica-Bold');
-      doc.text('Code',  40,  doc.y, { continued: true, width: 100 });
-      doc.text('Brand', 140, doc.y, { continued: true, width: 80 });
-      doc.text('Model', 220, doc.y, { continued: true, width: 130 });
-      doc.text('Size',  350, doc.y, { continued: true, width: 40 });
-      doc.text('Rent',  390, doc.y, { continued: true, width: 50 });
-      doc.text('Buy',   440, doc.y, { continued: true, width: 50 });
-      doc.text('Status', 490, doc.y);
-      doc.moveTo(40, doc.y + 4).lineTo(555, doc.y + 4).stroke('#e0d8c8');
-      doc.moveDown(0.5);
-      doc.font('Helvetica').fillColor('#0f0e0c').fontSize(8);
-      rows.forEach(r => {
-        if (doc.y > 770) { doc.addPage(); }
-        doc.text(r.shoe_code || '—', 40, doc.y, { continued: true, width: 100 });
-        doc.text((r.brand||'').slice(0,12), 140, doc.y, { continued: true, width: 80 });
-        doc.text((r.model||'').slice(0,20), 220, doc.y, { continued: true, width: 130 });
-        doc.text(r.size||'', 350, doc.y, { continued: true, width: 40 });
-        doc.text(r.rent_price ? `£${r.rent_price}` : '—', 390, doc.y, { continued: true, width: 50 });
-        doc.text(r.buy_price  ? `£${r.buy_price}`  : '—', 440, doc.y, { continued: true, width: 50 });
-        doc.text(r.status, 490, doc.y);
+      // Status counts
+      const byStatus = {};
+      shoes.forEach(s => { byStatus[s.status] = (byStatus[s.status] || 0) + 1; });
+
+      sectionTitle('Catalogue Overview');
+      const cardW = (PAGE_WIDTH - 30) / 4;
+      const cardY = doc.y;
+      statCard(PAGE_LEFT,                        cardY, cardW, 60, 'TOTAL',     shoes.length, COL_INK);
+      statCard(PAGE_LEFT + cardW + 10,            cardY, cardW, 60, 'LISTED',    byStatus.listed || 0, '#2a9d5d');
+      statCard(PAGE_LEFT + (cardW + 10) * 2,       cardY, cardW, 60, 'RENTED',    byStatus.rented || 0, '#1e6fb8');
+      statCard(PAGE_LEFT + (cardW + 10) * 3,       cardY, cardW, 60, 'SOLD',      byStatus.sold || 0, COL_GOLD);
+      doc.y = cardY + 80;
+
+      sectionTitle(`Shoes (${shoes.length})`);
+      tableHeader(['Code', 'Brand', 'Model', 'Size', 'Rent/day', 'Buy', 'Status'], [85, 70, 130, 30, 60, 60, 60]);
+      shoes.forEach((s, i) => {
+        tableRow([
+          s.shoe_code || '—',
+          (s.brand || '').slice(0, 11),
+          (s.model || '').slice(0, 20),
+          s.size || '',
+          s.rent_price ? '£' + s.rent_price : '—',
+          s.buy_price  ? '£' + s.buy_price  : '—',
+          s.status,
+        ], [85, 70, 130, 30, 60, 60, 60], i % 2 === 1);
       });
+      if (shoes.length === 200) {
+        doc.moveDown(0.5);
+        doc.fontSize(8).fillColor(COL_FAINT).text('Showing first 200 shoes — download CSV for full data', PAGE_LEFT, doc.y);
+      }
     }
 
     else {
-      doc.fontSize(12).fillColor('#7a7468').text(`PDF format not yet available for "${type}". Please use CSV export.`);
+      doc.fontSize(11).fillColor(COL_MUTED).text(`PDF report for "${type}" not yet available. Use CSV export instead.`, PAGE_LEFT, doc.y);
     }
 
-    // Footer on every page
+    // ── FOOTER ON EVERY PAGE ───────────────────────────────────────────
     const range = doc.bufferedPageRange();
     for (let i = 0; i < range.count; i++) {
       doc.switchToPage(range.start + i);
-      doc.fontSize(7).fillColor('#a09a8e').text(
-        `Beautifully Ordered Ltd · Co. No. 17231554 · beautifullyordered.co.uk · Page ${i + 1}/${range.count}`,
-        40, 810, { align: 'center', width: 515 }
+      // Footer line
+      doc.moveTo(PAGE_LEFT, 790).lineTo(PAGE_RIGHT, 790).lineWidth(0.5).strokeColor(COL_RULE).stroke();
+      doc.fontSize(7).fillColor(COL_FAINT).font('Helvetica').text(
+        'Beautifully Ordered Ltd · Co. No. 17231554 · beautifullyordered.co.uk',
+        PAGE_LEFT, 800, { align: 'left', width: PAGE_WIDTH * 0.7 }
+      );
+      doc.fontSize(7).fillColor(COL_FAINT).text(
+        `Page ${i + 1} of ${range.count}`,
+        PAGE_LEFT, 800, { align: 'right', width: PAGE_WIDTH }
+      );
+      doc.fontSize(7).fillColor(COL_FAINT).text(
+        `Generated ${new Date().toLocaleString('en-GB')}`,
+        PAGE_LEFT, 812, { align: 'left', width: PAGE_WIDTH }
       );
     }
 
@@ -1029,6 +1207,107 @@ router.get('/reports/:type', requireRole('admin'), async (req, res, next) => {
     }
 
     return res.status(400).json({ error: 'Unknown report type. Use: orders, shoes, payouts, users, newsletter, revenue-summary' });
+  } catch (err) { next(err); }
+});
+
+// POST /api/admin/edit/recurate — manually re-curate this week's Edit
+router.post('/edit/recurate', requireRole('admin'), async (req, res, next) => {
+  try {
+    const theEdit = require('../services/theEdit');
+    const result = await theEdit.recurateEdit();
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, 'edit_recurated', 'the_edit', NULL, $2)`,
+      [req.user.id, JSON.stringify(result)]
+    );
+    res.json({ ok: true, ...result });
+  } catch (err) { next(err); }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PHOTO LIBRARY — generic photos by brand+model+colour (admin-managed)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GET /api/admin/photo-library?brand=&model=&colour=
+router.get('/photo-library', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { brand, model, colour } = req.query;
+    let where = '1=1';
+    const params = [];
+    if (brand) { params.push(brand); where += ` AND brand ILIKE $${params.length}`; }
+    if (model) { params.push(model); where += ` AND model ILIKE $${params.length}`; }
+    if (colour){ params.push(colour); where += ` AND colour ILIKE $${params.length}`; }
+    const { rows } = await db.query(
+      `SELECT id, brand, model, colour, url, caption, is_primary, created_at
+       FROM shoe_photo_library
+       WHERE ${where}
+       ORDER BY brand, model, colour, is_primary DESC, created_at DESC`,
+      params
+    );
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
+// POST /api/admin/photo-library — add a new generic photo (URL-based)
+router.post('/photo-library', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { brand, model, colour, url, caption, is_primary } = req.body;
+    if (!brand || !model || !url) {
+      return res.status(400).json({ error: 'brand, model and url are required' });
+    }
+    const { rows } = await db.query(
+      `INSERT INTO shoe_photo_library (brand, model, colour, url, caption, is_primary, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [brand, model, colour || null, url, caption || null, !!is_primary, req.user.id]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/admin/photo-library/:id
+router.delete('/photo-library/:id', requireRole('admin'), async (req, res, next) => {
+  try {
+    await db.query(`DELETE FROM shoe_photo_library WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// GET /api/admin/photo-library/match?brand=&model=&colour=
+// Returns the best-matching photo for listing decisions
+router.get('/photo-library/match', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { brand, model, colour } = req.query;
+    if (!brand || !model) return res.json({ matches: [] });
+    // Try exact colour match first
+    let { rows } = await db.query(
+      `SELECT * FROM shoe_photo_library
+       WHERE brand ILIKE $1 AND model ILIKE $2 AND ($3::text IS NULL OR colour ILIKE $3)
+       ORDER BY is_primary DESC, created_at DESC LIMIT 6`,
+      [brand, model, colour || null]
+    );
+    // Fallback: any colour of same model
+    if (!rows.length && colour) {
+      const { rows: any } = await db.query(
+        `SELECT * FROM shoe_photo_library
+         WHERE brand ILIKE $1 AND model ILIKE $2
+         ORDER BY is_primary DESC, created_at DESC LIMIT 6`,
+        [brand, model]
+      );
+      rows = any;
+    }
+    res.json({ matches: rows });
+  } catch (err) { next(err); }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SUBMISSION TIMELINE — full activity history for a shoe
+// ──────────────────────────────────────────────────────────────────────────────
+
+router.get('/shoes/:id/timeline', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const events = require('../services/submissionEvents');
+    const timeline = await events.getTimeline(req.params.id);
+    res.json(timeline);
   } catch (err) { next(err); }
 });
 

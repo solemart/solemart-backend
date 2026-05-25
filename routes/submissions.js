@@ -82,6 +82,13 @@ router.post('/', authenticate, [
         'INSERT INTO submission_shoes (submission_id, shoe_id) VALUES ($1, $2)',
         [submission.id, createdShoe.id]
       );
+
+      // Log first event in the submission timeline
+      await client.query(
+        `INSERT INTO submission_events (shoe_id, event_type, status_after, actor_id, actor_role, notes)
+         VALUES ($1, 'submitted', 'submitted', $2, 'owner', $3)`,
+        [createdShoe.id, req.user.id, `Submitted ${shoe.brand} ${shoe.model}, UK ${shoe.size}`]
+      );
     }
 
     // Generate shipping label
