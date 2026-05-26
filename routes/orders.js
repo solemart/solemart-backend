@@ -39,10 +39,51 @@ router.post('/', authenticate, [
     );
     if (!shoeRows.length) return res.status(404).json({ error: 'Shoe not found' });
 
-    const shoe = shoeRows[0];
+    let shoe = shoeRows[0];
+
+    // FIFO ALLOCATION
+    // If the chosen shoe is no longer available (someone else just bought it),
+    // OR even if it IS available, prefer the oldest-listed pair in the same variant group.
+    // This ensures inventory rotates fairly across owners and the "stock count" stays accurate.
     if (shoe.status !== 'listed') {
-      return res.status(409).json({ error: 'Shoe is not currently available' });
+      // Try to find another pair in the same variant group
+      const { rows: fallbackRows } = await client.query(
+        `SELECT * FROM shoes
+         WHERE status = 'listed'
+           AND LOWER(brand) = LOWER($1)
+           AND LOWER(model) = LOWER($2)
+           AND LOWER(COALESCE(size,'')) = LOWER(COALESCE($3,''))
+           AND LOWER(COALESCE(colour,'')) = LOWER(COALESCE($4,''))
+           AND LOWER(COALESCE(assessed_wear_grade,'')) = LOWER(COALESCE($5,''))
+         ORDER BY listed_at ASC NULLS LAST
+         LIMIT 1`,
+        [shoe.brand, shoe.model, shoe.size, shoe.colour, shoe.assessed_wear_grade]
+      );
+      if (fallbackRows.length) {
+        shoe = fallbackRows[0];
+      } else {
+        return res.status(409).json({ error: 'Shoe is no longer available' });
+      }
+    } else {
+      // Optimisation: still use FIFO ordering — pick oldest if there are multiple
+      const { rows: oldestRows } = await client.query(
+        `SELECT * FROM shoes
+         WHERE status = 'listed'
+           AND LOWER(brand) = LOWER($1)
+           AND LOWER(model) = LOWER($2)
+           AND LOWER(COALESCE(size,'')) = LOWER(COALESCE($3,''))
+           AND LOWER(COALESCE(colour,'')) = LOWER(COALESCE($4,''))
+           AND LOWER(COALESCE(assessed_wear_grade,'')) = LOWER(COALESCE($5,''))
+         ORDER BY listed_at ASC NULLS LAST
+         LIMIT 1`,
+        [shoe.brand, shoe.model, shoe.size, shoe.colour, shoe.assessed_wear_grade]
+      );
+      if (oldestRows.length) shoe = oldestRows[0];
     }
+
+    // From here on, use the allocated shoe's actual id for everything
+    const allocatedShoeId = shoe.id;
+
     if (order_type === 'rent' && !['rent','both'].includes(shoe.listing_type)) {
       return res.status(409).json({ error: 'This shoe is not available for rent' });
     }
@@ -58,10 +99,10 @@ router.post('/', authenticate, [
 
     await client.query('BEGIN');
 
-    // Reserve the shoe
+    // Reserve the allocated shoe
     await client.query(
       `UPDATE shoes SET status = $1, updated_at = NOW() WHERE id = $2`,
-      [order_type === 'rent' ? 'rented' : 'sold', shoe_id]
+      [order_type === 'rent' ? 'rented' : 'sold', allocatedShoeId]
     );
 
     // Create Stripe payment intent (optional — only if Stripe is configured)
@@ -105,7 +146,7 @@ router.post('/', authenticate, [
           currency: 'gbp',
           customer: stripeCustomerId,
           setup_future_usage: order_type === 'rent' ? 'off_session' : undefined,
-          metadata: { shoe_id, order_type, customer_id: req.user.id },
+          metadata: { shoe_id: allocatedShoeId, order_type, customer_id: req.user.id },
           automatic_payment_methods: { enabled: true },
         };
 
@@ -149,7 +190,7 @@ router.post('/', authenticate, [
        VALUES ($1,$2,$3,$4,'confirmed',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
        RETURNING *`,
       [
-        reference, req.user.id, shoe_id, order_type,
+        reference, req.user.id, allocatedShoeId, order_type,
         unitPrice, rental_days || null, subtotal, platformFee, total,
         delivery_line1, delivery_line2 || null,
         delivery_city || null, delivery_county || null, delivery_postcode,
@@ -161,7 +202,7 @@ router.post('/', authenticate, [
     // Increment listing lifecycle count
     await client.query(
       `UPDATE shoes SET rental_count = rental_count + $1, updated_at = NOW() WHERE id = $2`,
-      [order_type === 'rent' ? 1 : 0, shoe_id]
+      [order_type === 'rent' ? 1 : 0, allocatedShoeId]
     );
 
     await client.query('COMMIT');

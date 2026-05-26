@@ -37,14 +37,36 @@ router.get('/dashboard', async (req, res, next) => {
 // ── GET /api/admin/queue ── intake processing queue ───────────
 router.get('/queue', async (req, res, next) => {
   try {
-    const { stage } = req.query; // authenticating | cleaning | submitted | all
+    const { stage } = req.query; // authenticating | cleaning | submitted | all | donations
+
+    // Donations-only filter
+    if (stage === 'donations') {
+      const { rows: donations } = await db.query(
+        `SELECT id, reference, donor_name, donor_email, donor_phone,
+                shoe_description, pair_count, notes,
+                collection_line1, collection_line2, collection_city,
+                collection_county, collection_postcode,
+                status, created_at, label_url
+         FROM donations
+         WHERE status NOT IN ('completed','rejected','cancelled')
+         ORDER BY created_at ASC`
+      );
+      return res.json(donations.map(d => ({
+        ...d,
+        submission_type: 'donation',
+        first_name: d.donor_name,
+        brand: 'Donation',
+        model: d.shoe_description,
+        size: `${d.pair_count} pair${d.pair_count > 1 ? 's' : ''}`,
+        submitted_at: d.created_at,
+      })));
+    }
 
     // Submissions = anything pre-listing (not yet on the catalogue)
-    // Once listed/sold/returned, it's NOT a submission anymore.
     let where = `s.status IN ('submitted','in_transit','authenticating','cleaning','rejected')`;
     if (stage && stage !== 'all') where = `s.status = '${stage}'`;
 
-    const { rows } = await db.query(
+    const { rows: shoeSubmissions } = await db.query(
       `SELECT s.*, u.first_name, u.last_name, u.email,
               ls.reference AS submission_ref, ls.collection_postcode,
               COALESCE(
@@ -59,7 +81,43 @@ router.get('/queue', async (req, res, next) => {
        WHERE ${where}
        ORDER BY s.submitted_at ASC`,
     );
-    res.json(rows);
+
+    // Also include unprocessed donations in the unified queue
+    let donations = [];
+    if (!stage || stage === 'all') {
+      try {
+        const { rows } = await db.query(
+          `SELECT id, reference, donor_name, donor_email, shoe_description,
+                  pair_count, status, created_at, collection_postcode, label_url
+           FROM donations
+           WHERE status NOT IN ('completed','rejected','cancelled')
+           ORDER BY created_at ASC`
+        );
+        donations = rows.map(d => ({
+          id:                 d.id,
+          submission_type:    'donation',
+          submission_ref:     d.reference,
+          first_name:         d.donor_name,
+          last_name:          '',
+          email:              d.donor_email,
+          brand:              'Donation',
+          model:              d.shoe_description,
+          size:               `${d.pair_count} pair${d.pair_count > 1 ? 's' : ''}`,
+          status:             d.status,
+          submitted_at:       d.created_at,
+          collection_postcode: d.collection_postcode,
+          emoji:              '💚',
+          owner_photos:       [],
+          label_url:          d.label_url,
+          pair_count:         d.pair_count,
+        }));
+      } catch (e) {
+        // Donations table optional — silent fallback
+      }
+    }
+
+    res.json([...shoeSubmissions, ...donations].sort((a, b) =>
+      new Date(a.submitted_at) - new Date(b.submitted_at)));
   } catch (err) { next(err); }
 });
 
@@ -452,11 +510,15 @@ router.get('/orders', requireRole('staff', 'admin'), async (req, res, next) => {
 router.get('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { status } = req.query;
-    let where = '1=1';
-    const params = [];
+    let where, params = [];
     if (status && status !== 'all') {
       params.push(status);
       where = `s.status = $${params.length}`;
+    } else {
+      // "All" in Live Catalogue means active live shoes only:
+      // listed, rented, sold — NOT returned_to_owner (those belong in Returns)
+      // and NOT submitted/in_transit/authenticating/cleaning/rejected (those belong in Submissions)
+      where = `s.status IN ('listed','rented','sold')`;
     }
     const { rows } = await db.query(
       `SELECT s.*,
@@ -636,11 +698,11 @@ router.post('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
       brand, model, size, colour, category, gender, condition,
       rrp, rent_price, buy_price, owner_id, owner_email,
       description, emoji, auth_grade, assessed_wear_grade,
-      barcode, listing_type,
+      barcode, listing_type, status,
     } = req.body;
 
     if (!brand || !model || !size) {
-      return res.status(400).json({ error: 'brand, model and size are required' });
+      return res.status(400).json({ error: 'Brand, model and size are required' });
     }
 
     // Find or use specified owner
@@ -655,32 +717,72 @@ router.post('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
       ownerIdToUse = req.user.id;
     }
 
-    // Generate unique shoe code
-    const { generateUniqueShoeCode } = require('../services/shoeCodes');
-    const shoeCode = await generateUniqueShoeCode(brand);
+    // Default to 'submitted' so it appears in Submissions tab for proper review.
+    // Admin can change it to 'listed' afterwards (which assigns KSM code automatically).
+    const initialStatus = status || 'submitted';
+    const isListing = initialStatus === 'listed';
+
+    // Only generate a KSM code if creating as listed (not for drafts)
+    let shoeCode = null;
+    if (isListing) {
+      try {
+        const { generateUniqueShoeCode } = require('../services/shoeCodes');
+        shoeCode = await generateUniqueShoeCode(brand);
+      } catch (e) {
+        // shoeCodes service may not exist on older deployments — skip silently
+        console.warn('shoeCodes service unavailable:', e.message);
+      }
+    }
+
+    // Build INSERT dynamically — only include shoe_code if column exists
+    let columns = ['owner_id', 'brand', 'model', 'size', 'colour', 'category', 'gender', 'condition',
+                   'rrp', 'rent_price', 'buy_price', 'description', 'emoji', 'auth_grade',
+                   'assessed_wear_grade', 'listing_type', 'status'];
+    let values  = [ownerIdToUse, brand, model, size, colour || null, category || null,
+                   gender || 'Unisex', condition || 'Excellent',
+                   rrp || null, rent_price || null, buy_price || null,
+                   description || null, emoji || '👟', auth_grade || null,
+                   assessed_wear_grade || null, listing_type || 'both', initialStatus];
+
+    if (shoeCode) {
+      columns.push('shoe_code', 'listed_at');
+      values.push(shoeCode);
+      values.push(new Date());
+    }
+
+    const placeholders = values.map((_, i) => '$' + (i + 1)).join(',');
+    const colList = columns.join(',');
 
     const { rows } = await db.query(
-      `INSERT INTO shoes (
-        shoe_code, owner_id, brand, model, size, colour, category, gender, condition,
-        rrp, rent_price, buy_price, description, emoji, auth_grade, assessed_wear_grade,
-        listing_type, status, listed_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'listed',NOW())
-      RETURNING *`,
-      [shoeCode, ownerIdToUse, brand, model, size, colour || null, category || null, gender || 'Unisex',
-       condition || 'Excellent', rrp || null, rent_price || null, buy_price || null,
-       description || null, emoji || '👟', auth_grade || 'A', assessed_wear_grade || 'Mint',
-       listing_type || 'both']
+      `INSERT INTO shoes (${colList}) VALUES (${placeholders}) RETURNING *`,
+      values
     );
 
-    // Log
+    // Log to submission_events if the table exists (newer schema)
+    try {
+      await db.query(
+        `INSERT INTO submission_events (shoe_id, event_type, status_after, actor_id, actor_role, notes)
+         VALUES ($1, $2, $3, $4, 'kosmos', $5)`,
+        [rows[0].id, isListing ? 'listed' : 'submitted', initialStatus, req.user.id,
+         isListing ? `Listed directly by ${req.user.email}` : `Created by Kosmos admin`]
+      );
+    } catch (e) {
+      // submission_events table may not exist on older deployments — skip
+    }
+
+    // Activity log
     await db.query(
       `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
-       VALUES ($1, 'admin_registered_shoe', 'shoe', $2, $3)`,
-      [req.user.id, rows[0].id, JSON.stringify({ shoe_code: shoeCode, brand, model, barcode: barcode || null })]
+       VALUES ($1, $2, 'shoe', $3, $4)`,
+      [req.user.id, isListing ? 'admin_listed_shoe' : 'admin_created_submission',
+       rows[0].id, JSON.stringify({ shoe_code: shoeCode, brand, model, barcode: barcode || null })]
     );
 
     res.status(201).json(rows[0]);
-  } catch (err) { next(err); }
+  } catch (err) {
+    console.error('POST /admin/shoes error:', err);
+    next(err);
+  }
 });
 
 // GET /api/admin/shoes/by-code/:code — lookup a shoe by its KSM code
@@ -715,20 +817,36 @@ router.patch('/shoes/:id/prices', requireRole('staff', 'admin'), async (req, res
     }
     if (!updates.length) return res.status(400).json({ error: 'No price changes specified' });
 
+    // Get current shoe to identify its variant group
+    const { rows: [target] } = await db.query(
+      `SELECT brand, model, size, colour, assessed_wear_grade FROM shoes WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!target) return res.status(404).json({ error: 'Shoe not found' });
+
+    // Price sync: apply to ALL listed pairs in the same variant group
+    // (Brand + Model + Size + Colour + Wear Grade — prices stay in sync per the architecture)
     updates.push(`updated_at = NOW()`);
-    values.push(req.params.id);
+    const variantParams = [target.brand, target.model, target.size, target.colour, target.assessed_wear_grade];
     const { rows } = await db.query(
-      `UPDATE shoes SET ${updates.join(', ')} WHERE id = $${n} RETURNING *`,
-      values
+      `UPDATE shoes SET ${updates.join(', ')}
+       WHERE status = 'listed'
+         AND LOWER(brand) = LOWER($${n++})
+         AND LOWER(model) = LOWER($${n++})
+         AND LOWER(COALESCE(size,'')) = LOWER(COALESCE($${n++},''))
+         AND LOWER(COALESCE(colour,'')) = LOWER(COALESCE($${n++},''))
+         AND LOWER(COALESCE(assessed_wear_grade,'')) = LOWER(COALESCE($${n++},''))
+       RETURNING *`,
+      [...values, ...variantParams]
     );
 
     await db.query(
       `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
        VALUES ($1, 'price_updated', 'shoe', $2, $3)`,
-      [req.user.id, req.params.id, JSON.stringify(req.body)]
+      [req.user.id, req.params.id, JSON.stringify({ ...req.body, synced_count: rows.length })]
     );
 
-    res.json(rows[0]);
+    res.json({ updated_count: rows.length, shoes: rows });
   } catch (err) { next(err); }
 });
 
@@ -736,7 +854,7 @@ router.patch('/shoes/:id/prices', requireRole('staff', 'admin'), async (req, res
 router.patch('/shoes/:id/details', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const allowed = ['brand','model','size','colour','category','gender','condition',
-                     'description','emoji','auth_grade','assessed_wear_grade','status'];
+                     'description','emoji','assessed_wear_grade','status'];
     const updates = [];
     const values = [];
     let n = 1;
@@ -1309,6 +1427,104 @@ router.get('/shoes/:id/timeline', requireRole('staff', 'admin'), async (req, res
     const timeline = await events.getTimeline(req.params.id);
     res.json(timeline);
   } catch (err) { next(err); }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DONATIONS — admin updates + convert to shoe submissions
+// ──────────────────────────────────────────────────────────────────────────────
+
+router.patch('/donations/:id', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { status } = req.body;
+    const allowedStatuses = ['pending','collected','processing','completed','rejected','cancelled'];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+    const { rows } = await db.query(
+      `UPDATE donations SET status = $1 WHERE id = $2 RETURNING *`,
+      [status, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Donation not found' });
+
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, $2, 'donation', $3, $4)`,
+      [req.user.id, 'donation_status_changed', req.params.id, JSON.stringify({ status })]
+    );
+
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
+// POST /api/admin/donations/:id/convert — turn a donation into shoe submissions
+router.post('/donations/:id/convert', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { rows: [donation] } = await db.query(
+      `SELECT * FROM donations WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!donation) return res.status(404).json({ error: 'Donation not found' });
+
+    // Find or create the donor as a user (so they own the resulting shoes)
+    let donorId;
+    const { rows: existing } = await db.query(
+      `SELECT id FROM users WHERE email = $1`,
+      [donation.donor_email]
+    );
+    if (existing.length) {
+      donorId = existing[0].id;
+    } else {
+      // Create a passive account for the donor (they can claim it later if they sign up)
+      const { rows: newUser } = await db.query(
+        `INSERT INTO users (email, first_name, last_name, role, source)
+         VALUES ($1, $2, $3, 'customer', 'donation') RETURNING id`,
+        [donation.donor_email, donation.donor_name || 'Donor', '']
+      );
+      donorId = newUser[0].id;
+    }
+
+    // Create N shoe submissions (one per pair donated)
+    const created = [];
+    for (let i = 0; i < (donation.pair_count || 1); i++) {
+      const { rows } = await db.query(
+        `INSERT INTO shoes (
+          owner_id, brand, model, size, condition,
+          listing_type, status, description, emoji
+        ) VALUES ($1, 'Donation', $2, 'TBC', 'TBC', 'both', 'submitted', $3, '💚')
+        RETURNING id`,
+        [donorId,
+         `Donated pair ${i + 1} of ${donation.pair_count}`,
+         `From donation ${donation.reference}: ${donation.shoe_description}`]
+      );
+      created.push(rows[0].id);
+
+      // Try to log submission event if table exists
+      try {
+        await db.query(
+          `INSERT INTO submission_events (shoe_id, event_type, status_after, actor_id, actor_role, notes)
+           VALUES ($1, 'submitted', 'submitted', $2, 'kosmos', $3)`,
+          [rows[0].id, req.user.id, `Converted from donation ${donation.reference}`]
+        );
+      } catch (e) {}
+    }
+
+    // Mark donation as processed
+    await db.query(
+      `UPDATE donations SET status = 'completed' WHERE id = $1`,
+      [donation.id]
+    );
+
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, 'donation_converted', 'donation', $2, $3)`,
+      [req.user.id, donation.id, JSON.stringify({ created_count: created.length, shoe_ids: created })]
+    );
+
+    res.json({ ok: true, created: created.length, shoe_ids: created });
+  } catch (err) {
+    console.error('Donation convert error:', err);
+    next(err);
+  }
 });
 
 module.exports = router;
