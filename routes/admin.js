@@ -63,7 +63,7 @@ router.get('/queue', async (req, res, next) => {
     }
 
     // Submissions = anything pre-listing (not yet on the catalogue)
-    let where = `s.status IN ('submitted','in_transit','authenticating','cleaning','rejected')`;
+    let where = `s.status IN ('awaiting_approval','submitted','in_transit','authenticating','cleaning','rejected')`;
     if (stage && stage !== 'all') where = `s.status = '${stage}'`;
 
     const { rows: shoeSubmissions } = await db.query(
@@ -691,16 +691,18 @@ router.patch('/settings/:key', requireRole('admin'), async (req, res, next) => {
 // ADMIN SHOE REGISTRATION (with scanner / manual entry)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// POST /api/admin/shoes — admin registers a new shoe (bypasses owner submission flow)
+// POST /api/admin/shoes — admin registers a new shoe
 router.post('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const {
       brand, model, size, colour, category, gender, condition,
       rrp, rent_price, buy_price, owner_id, owner_email,
-      description, emoji, auth_grade, assessed_wear_grade,
+      description, assessed_wear_grade,
       barcode, listing_type, status,
+      library_photo_id, photos,
     } = req.body;
 
+    // Validation
     if (!brand || !model || !size) {
       return res.status(400).json({ error: 'Brand, model and size are required' });
     }
@@ -709,79 +711,126 @@ router.post('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
     let ownerIdToUse = owner_id;
     if (!ownerIdToUse && owner_email) {
       const { rows } = await db.query(`SELECT id FROM users WHERE email = $1`, [owner_email]);
-      if (!rows.length) return res.status(404).json({ error: `No user with email ${owner_email}` });
+      if (!rows.length) {
+        return res.status(404).json({ error: `No user found with email ${owner_email}` });
+      }
       ownerIdToUse = rows[0].id;
     }
     if (!ownerIdToUse) {
-      // Default: admin registers under their own account
-      ownerIdToUse = req.user.id;
+      ownerIdToUse = req.user.id; // default to admin
     }
 
-    // Default to 'submitted' so it appears in Submissions tab for proper review.
-    // Admin can change it to 'listed' afterwards (which assigns KSM code automatically).
-    const initialStatus = status || 'submitted';
+    // Normalise condition to one of the two valid values
+    const normalisedCondition = condition === 'New' ? 'New' : 'Pre-owned';
+
+    // Default to 'awaiting_approval' for admin-registered shoes — they need final approval before listing
+    const initialStatus = status || 'awaiting_approval';
     const isListing = initialStatus === 'listed';
 
-    // Only generate a KSM code if creating as listed (not for drafts)
+    // Only generate a KSM code if creating as listed
     let shoeCode = null;
     if (isListing) {
       try {
         const { generateUniqueShoeCode } = require('../services/shoeCodes');
         shoeCode = await generateUniqueShoeCode(brand);
       } catch (e) {
-        // shoeCodes service may not exist on older deployments — skip silently
-        console.warn('shoeCodes service unavailable:', e.message);
+        console.warn('Could not generate shoe code:', e.message);
       }
     }
 
-    // Build INSERT dynamically — only include shoe_code if column exists
+    // Probe which columns actually exist in the shoes table (defensive against partial migrations)
+    let hasShoeCode = false, hasLibraryPhotoId = false;
+    try {
+      const { rows: cols } = await db.query(
+        `SELECT column_name FROM information_schema.columns WHERE table_name = 'shoes'`
+      );
+      const colNames = cols.map(c => c.column_name);
+      hasShoeCode = colNames.includes('shoe_code');
+      hasLibraryPhotoId = colNames.includes('library_photo_id');
+    } catch (e) { /* fallback - assume nothing */ }
+
+    // Build INSERT dynamically — only include columns that exist
     let columns = ['owner_id', 'brand', 'model', 'size', 'colour', 'category', 'gender', 'condition',
-                   'rrp', 'rent_price', 'buy_price', 'description', 'emoji', 'auth_grade',
+                   'rrp', 'rent_price', 'buy_price', 'description',
                    'assessed_wear_grade', 'listing_type', 'status'];
     let values  = [ownerIdToUse, brand, model, size, colour || null, category || null,
-                   gender || 'Unisex', condition || 'Excellent',
+                   gender || 'Unisex', normalisedCondition,
                    rrp || null, rent_price || null, buy_price || null,
-                   description || null, emoji || '👟', auth_grade || null,
+                   description || null,
                    assessed_wear_grade || null, listing_type || 'both', initialStatus];
 
-    if (shoeCode) {
+    // Default emoji (legacy column may or may not exist; harmless if it does)
+    columns.push('emoji'); values.push('👟');
+
+    if (hasShoeCode && shoeCode) {
       columns.push('shoe_code', 'listed_at');
       values.push(shoeCode);
       values.push(new Date());
+    } else if (hasShoeCode) {
+      // include null for shoe_code so query doesn't drift later
+    }
+    if (hasLibraryPhotoId && library_photo_id) {
+      columns.push('library_photo_id');
+      values.push(library_photo_id);
     }
 
     const placeholders = values.map((_, i) => '$' + (i + 1)).join(',');
     const colList = columns.join(',');
 
-    const { rows } = await db.query(
-      `INSERT INTO shoes (${colList}) VALUES (${placeholders}) RETURNING *`,
-      values
-    );
+    let createdShoe;
+    try {
+      const { rows } = await db.query(
+        `INSERT INTO shoes (${colList}) VALUES (${placeholders}) RETURNING *`,
+        values
+      );
+      createdShoe = rows[0];
+    } catch (e) {
+      console.error('Shoe INSERT failed:', e.message, 'columns:', colList);
+      return res.status(500).json({ error: `Database insert failed: ${e.message}` });
+    }
 
-    // Log to submission_events if the table exists (newer schema)
+    // Save uploaded photos (base64 data URLs) — store as shoe_photos rows
+    if (Array.isArray(photos) && photos.length) {
+      for (let i = 0; i < photos.length; i++) {
+        try {
+          await db.query(
+            `INSERT INTO shoe_photos (shoe_id, url, caption, sort_order)
+             VALUES ($1, $2, $3, $4)`,
+            [createdShoe.id, photos[i], `Photo ${i + 1}`, i]
+          );
+        } catch (e) {
+          console.warn('Photo save failed (idx ' + i + '):', e.message);
+          // Continue — don't fail entire registration over one photo
+        }
+      }
+    }
+
+    // Log to submission_events
     try {
       await db.query(
         `INSERT INTO submission_events (shoe_id, event_type, status_after, actor_id, actor_role, notes)
          VALUES ($1, $2, $3, $4, 'kosmos', $5)`,
-        [rows[0].id, isListing ? 'listed' : 'submitted', initialStatus, req.user.id,
-         isListing ? `Listed directly by ${req.user.email}` : `Created by Kosmos admin`]
+        [createdShoe.id, isListing ? 'listed' : 'submitted', initialStatus, req.user.id,
+         isListing ? `Listed directly by ${req.user.email || 'admin'}`
+                   : `Created by Kosmos admin — awaiting approval`]
       );
-    } catch (e) {
-      // submission_events table may not exist on older deployments — skip
-    }
+    } catch (e) { /* table may not exist on older deploys */ }
 
     // Activity log
-    await db.query(
-      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
-       VALUES ($1, $2, 'shoe', $3, $4)`,
-      [req.user.id, isListing ? 'admin_listed_shoe' : 'admin_created_submission',
-       rows[0].id, JSON.stringify({ shoe_code: shoeCode, brand, model, barcode: barcode || null })]
-    );
+    try {
+      await db.query(
+        `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+         VALUES ($1, $2, 'shoe', $3, $4)`,
+        [req.user.id, isListing ? 'admin_listed_shoe' : 'admin_created_submission',
+         createdShoe.id, JSON.stringify({ shoe_code: shoeCode, brand, model, barcode: barcode || null,
+                                          photo_count: (photos || []).length })]
+      );
+    } catch (e) { /* log table optional */ }
 
-    res.status(201).json(rows[0]);
+    res.status(201).json(createdShoe);
   } catch (err) {
-    console.error('POST /admin/shoes error:', err);
-    next(err);
+    console.error('POST /admin/shoes ERROR:', err);
+    res.status(500).json({ error: err.message || 'Unexpected error registering shoe' });
   }
 });
 
