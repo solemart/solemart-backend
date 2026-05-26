@@ -55,7 +55,8 @@ app.use(cors({
 app.options('*', cors());
 app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }), webhookRoutes);
 app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ limit: '25mb', extended: true }));
 app.use(express.urlencoded({ extended: true }));
 if (process.env.NODE_ENV !== 'test') { app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) } })); }
 const globalLimiter = rateLimit({ windowMs: 15*60*1000, max: 100, standardHeaders: true, legacyHeaders: false });
@@ -109,6 +110,35 @@ setTimeout(() => {
     processLateFees().catch(err => logger.error('Late fee job error:', err));
   }, 24 * 60 * 60 * 1000);
 }, 30 * 1000);
+
+// ── WEEKLY EDIT CURATION (Thursdays 06:00 UTC) ────────────────────────────────
+const theEdit = require('./services/theEdit');
+
+function scheduleNextEditCuration() {
+  const now = new Date();
+  const next = new Date(now);
+  const day = next.getUTCDay(); // 4 = Thursday
+  let daysUntilThursday = (4 - day + 7) % 7;
+  // If today is Thursday and it's already past 06:00 UTC, go to next Thursday
+  if (daysUntilThursday === 0 && now.getUTCHours() >= 6) {
+    daysUntilThursday = 7;
+  }
+  next.setUTCDate(now.getUTCDate() + daysUntilThursday);
+  next.setUTCHours(6, 0, 0, 0);
+  const msUntil = next.getTime() - now.getTime();
+  logger.info(`Next Edit curation: ${next.toISOString()} (in ${(msUntil/3600000).toFixed(1)}h)`);
+  setTimeout(async () => {
+    try {
+      await theEdit.recurateEdit();
+      logger.info('✨ Weekly Edit auto-curated');
+    } catch (e) {
+      logger.error('Edit curation failed:', e);
+    }
+    scheduleNextEditCuration();
+  }, msUntil);
+}
+// Kick off scheduler 60 seconds after server start
+setTimeout(scheduleNextEditCuration, 60 * 1000);
 
 app.listen(PORT, () => { logger.info(`Kosmos API running on port ${PORT} [${process.env.NODE_ENV}]`); });
 module.exports = app;
