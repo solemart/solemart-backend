@@ -116,7 +116,61 @@ router.get('/queue', async (req, res, next) => {
       }
     }
 
-    res.json([...shoeSubmissions, ...donations].sort((a, b) =>
+    // Also include active clean-only bookings — these live in the Cleaning sub-tab
+    // alongside rental-return shoes (which have status='cleaning' on the shoes table)
+    let cleanBookings = [];
+    if (!stage || stage === 'all' || stage === 'cleaning') {
+      try {
+        const { rows } = await db.query(
+          `SELECT cb.*, u.first_name AS user_first_name, u.last_name AS user_last_name
+           FROM clean_bookings cb
+           LEFT JOIN users u ON u.id = cb.customer_id
+           WHERE cb.status NOT IN ('returned','cancelled')
+           ORDER BY cb.booked_at ASC`
+        );
+        cleanBookings = rows.map(cb => ({
+          id:                 cb.id,
+          submission_type:    'clean_only',
+          submission_ref:     cb.reference,
+          first_name:         cb.contact_name || cb.user_first_name || 'Customer',
+          last_name:          cb.user_last_name || '',
+          email:              cb.contact_email,
+          phone:              cb.contact_phone,
+          brand:              cb.service_name || 'Cleaning',
+          model:              cb.shoe_description,
+          size:               `${cb.pair_count} pair${cb.pair_count > 1 ? 's' : ''}`,
+          // Map clean-booking statuses to a unified status that the UI understands
+          // booked/collected → still in transit
+          // in_progress → cleaning sub-tab
+          // complete → ready to return to customer (still cleaning sub-tab, different action)
+          status: (cb.status === 'booked' || cb.status === 'collected')
+                    ? 'in_transit'
+                    : (cb.status === 'in_progress' || cb.status === 'complete')
+                      ? 'cleaning'
+                      : cb.status,
+          internal_status:    cb.status, // raw booking status for action button logic
+          submitted_at:       cb.booked_at,
+          collection_postcode: cb.return_postcode,
+          emoji:              '🧹',
+          owner_photos:       [],
+          label_url:          cb.label_url,
+          pair_count:         cb.pair_count,
+          service_type:       cb.service_type,
+          total_price:        cb.total_price,
+          return_address: {
+            line1:    cb.return_line1,
+            line2:    cb.return_line2,
+            city:     cb.return_city,
+            county:   cb.return_county,
+            postcode: cb.return_postcode,
+          },
+        }));
+      } catch (e) {
+        console.warn('Clean bookings table query failed:', e.message);
+      }
+    }
+
+    res.json([...shoeSubmissions, ...donations, ...cleanBookings].sort((a, b) =>
       new Date(a.submitted_at) - new Date(b.submitted_at)));
   } catch (err) { next(err); }
 });
@@ -851,6 +905,97 @@ router.get('/shoes/by-code/:code', requireRole('staff', 'admin'), async (req, re
   } catch (err) { next(err); }
 });
 
+// POST /api/admin/shoes/:id/return-review — admin marks a rental returned + decides next stage
+// Pass → cleaning sub-tab (will be cleaned then re-listed)
+// Fail → rejected sub-tab (owner notified)
+router.post('/shoes/:id/return-review', requireRole('staff', 'admin'), async (req, res, next) => {
+  const client = await db.connect();
+  try {
+    const { outcome, notes } = req.body;
+    if (!['pass', 'fail'].includes(outcome)) {
+      return res.status(400).json({ error: 'Outcome must be pass or fail' });
+    }
+    const newStatus = outcome === 'pass' ? 'cleaning' : 'rejected';
+
+    await client.query('BEGIN');
+
+    // 1. Verify shoe exists + get owner info
+    const { rows: [shoe] } = await client.query(
+      `SELECT s.*, u.first_name, u.email AS owner_email
+       FROM shoes s JOIN users u ON u.id = s.owner_id
+       WHERE s.id = $1`,
+      [req.params.id]
+    );
+    if (!shoe) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Shoe not found' });
+    }
+
+    // 2. Mark any active rental as completed/returned
+    let updatedOrderId = null;
+    const { rows: activeOrders } = await client.query(
+      `SELECT id, reference, status FROM orders
+       WHERE shoe_id = $1
+         AND status IN ('confirmed','dispatched','delivered','active_rental','returned','return_requested')
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [req.params.id]
+    );
+    if (activeOrders.length) {
+      updatedOrderId = activeOrders[0].id;
+      await client.query(
+        `UPDATE orders SET status = 'completed', actual_return_date = NOW(), updated_at = NOW()
+         WHERE id = $1`,
+        [updatedOrderId]
+      );
+    }
+
+    // 3. Update shoe status
+    await client.query(
+      `UPDATE shoes SET status = $1, updated_at = NOW() WHERE id = $2`,
+      [newStatus, req.params.id]
+    );
+
+    // 4. Log to submission_events timeline (visible to owner)
+    try {
+      const ownerNotes = outcome === 'pass'
+        ? `Returned in good condition — sent to cleaning. ${notes || ''}`.trim()
+        : `Returned with issues — rejected. ${notes || ''}`.trim();
+      await client.query(
+        `INSERT INTO submission_events (shoe_id, event_type, status_after, actor_id, actor_role, notes, visible_to_owner)
+         VALUES ($1, $2, $3, $4, 'kosmos', $5, TRUE)`,
+        [req.params.id, `return_${outcome}`, newStatus, req.user.id, ownerNotes]
+      );
+    } catch (e) {
+      // Table optional on older schemas — non-fatal
+    }
+
+    // 5. Log to activity feed
+    await client.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, $2, 'shoe', $3, $4)`,
+      [req.user.id, `rental_return_${outcome}`, req.params.id,
+       JSON.stringify({ order_id: updatedOrderId, notes: notes || null, new_status: newStatus })]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      ok: true,
+      shoe_id: req.params.id,
+      order_id: updatedOrderId,
+      new_status: newStatus,
+      outcome,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(()=>{});
+    console.error('POST /admin/shoes/:id/return-review error:', err);
+    res.status(500).json({ error: err.message || 'Could not process return' });
+  } finally {
+    client.release();
+  }
+});
+
 // PATCH /api/admin/shoes/:id/prices — update prices and key fields
 router.patch('/shoes/:id/prices', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
@@ -1574,6 +1719,172 @@ router.post('/donations/:id/convert', requireRole('staff', 'admin'), async (req,
     console.error('Donation convert error:', err);
     next(err);
   }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CLEAN BOOKINGS — admin lifecycle: collected → in_progress → complete → returned
+// ──────────────────────────────────────────────────────────────────────────────
+
+// PATCH /api/admin/clean-bookings/:id/status — change a clean booking's status
+router.patch('/clean-bookings/:id/status', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { status, notes } = req.body;
+    const valid = ['booked','collected','in_progress','complete','returned','cancelled'];
+    if (!valid.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    // Status-specific timestamp columns
+    const tsCol = {
+      collected: 'collected_at',
+      complete:  'completed_at',
+      returned:  'returned_at',
+    }[status];
+
+    const setClause = tsCol
+      ? `status = $1, ${tsCol} = COALESCE(${tsCol}, NOW())`
+      : `status = $1`;
+
+    const { rows } = await db.query(
+      `UPDATE clean_bookings SET ${setClause} WHERE id = $2 RETURNING *`,
+      [status, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Clean booking not found' });
+
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, $2, 'clean_booking', $3, $4)`,
+      [req.user.id, `clean_${status}`, req.params.id, JSON.stringify({ notes: notes || null })]
+    );
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Clean booking status update error:', err);
+    next(err);
+  }
+});
+
+// POST /api/admin/clean-bookings/:id/return-to-customer
+// Marks booking complete → generates return label → notifies customer → starts tracking
+router.post('/clean-bookings/:id/return-to-customer', requireRole('staff', 'admin'), async (req, res, next) => {
+  const client = await db.connect();
+  try {
+    const { tracking_number, carrier, label_url, notes } = req.body;
+
+    await client.query('BEGIN');
+
+    // Get booking with customer info
+    const { rows: [booking] } = await client.query(
+      `SELECT cb.*,
+              u.email AS user_email, u.first_name AS user_first
+       FROM clean_bookings cb
+       LEFT JOIN users u ON u.id = cb.customer_id
+       WHERE cb.id = $1`,
+      [req.params.id]
+    );
+    if (!booking) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Clean booking not found' });
+    }
+
+    // Generate return label (placeholder — wire to a real carrier API later)
+    // For now: use the URL admin provided, or auto-generate a placeholder reference
+    let finalTrackingNumber = tracking_number || null;
+    let finalLabelUrl       = label_url || booking.label_url || null;
+    let finalCarrier        = carrier || 'royal-mail';
+
+    if (!finalTrackingNumber) {
+      // Generate a placeholder tracking number — replace with real carrier integration later
+      finalTrackingNumber = `KSM${booking.reference.replace(/[^0-9A-Z]/gi,'').toUpperCase().slice(0,8)}${Math.floor(Math.random()*9000+1000)}`;
+    }
+    if (!finalLabelUrl) {
+      // Placeholder label URL — TODO: integrate Royal Mail / ShipEngine API
+      finalLabelUrl = `https://api.kosmos.co.uk/labels/clean-return/${booking.id}.pdf`;
+    }
+
+    // Update the booking: set tracking + status=complete (ready for delivery)
+    await client.query(
+      `UPDATE clean_bookings
+       SET status = 'complete',
+           label_url = $1,
+           return_tracking_number = $2,
+           return_carrier = $3,
+           return_label_created_at = NOW(),
+           completed_at = COALESCE(completed_at, NOW())
+       WHERE id = $4`,
+      [finalLabelUrl, finalTrackingNumber, finalCarrier, req.params.id]
+    );
+
+    // Notify the customer — send email if possible
+    const recipientEmail = booking.user_email || booking.contact_email;
+    const recipientName  = booking.user_first || booking.contact_name || 'there';
+    try {
+      const { sendEmail } = require('../services/email');
+      const trackingLink = `${process.env.SITE_URL || 'https://beautifullyordered.co.uk'}/?page=account&tab=cleans&track=${booking.id}`;
+      await sendEmail({
+        to: recipientEmail,
+        subject: `Your clean is on its way back — ${booking.reference}`,
+        html: `
+          <p>Hi ${recipientName},</p>
+          <p>Your shoes have been cleaned to our standard and are on their way back to you.</p>
+          <p><strong>Tracking number:</strong> ${finalTrackingNumber}<br/>
+          <strong>Carrier:</strong> ${finalCarrier === 'royal-mail' ? 'Royal Mail' : finalCarrier}</p>
+          <p>Track your return: <a href="${trackingLink}">${trackingLink}</a></p>
+          ${notes ? `<p><em>Notes from our team:</em> ${notes}</p>` : ''}
+          <p>Thanks for choosing Kosmos.<br/>— Beautifully Ordered</p>
+        `,
+      });
+    } catch (e) {
+      console.warn('Email send skipped:', e.message);
+    }
+
+    // Activity log
+    await client.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, 'clean_return_dispatched', 'clean_booking', $2, $3)`,
+      [req.user.id, req.params.id,
+       JSON.stringify({ tracking_number: finalTrackingNumber, carrier: finalCarrier, notified: !!recipientEmail })]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      ok: true,
+      tracking_number: finalTrackingNumber,
+      carrier: finalCarrier,
+      label_url: finalLabelUrl,
+      notified: !!recipientEmail,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(()=>{});
+    console.error('Clean return-to-customer error:', err);
+    res.status(500).json({ error: err.message || 'Could not process return' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/admin/clean-bookings/:id/mark-delivered — manual confirmation when tracking shows delivered
+router.post('/clean-bookings/:id/mark-delivered', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { rows } = await db.query(
+      `UPDATE clean_bookings
+       SET status = 'returned',
+           returned_at = COALESCE(returned_at, NOW())
+       WHERE id = $1
+       RETURNING *`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Clean booking not found' });
+
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, 'clean_delivered', 'clean_booking', $2, '{}')`,
+      [req.user.id, req.params.id]
+    );
+
+    res.json(rows[0]);
+  } catch (err) { next(err); }
 });
 
 module.exports = router;
