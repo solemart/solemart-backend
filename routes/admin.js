@@ -70,7 +70,7 @@ router.get('/queue', async (req, res, next) => {
       `SELECT s.*, u.first_name, u.last_name, u.email,
               ls.reference AS submission_ref, ls.collection_postcode,
               COALESCE(
-                (SELECT json_agg(json_build_object('url', sp.url, 'caption', sp.caption) ORDER BY sp.sort_order)
+                (SELECT json_agg(json_build_object('id', sp.id, 'url', sp.url, 'caption', sp.caption, 'is_cover', COALESCE(sp.is_cover, FALSE), 'uploaded_by_role', sp.uploaded_by_role) ORDER BY COALESCE(sp.is_cover, FALSE) DESC, sp.sort_order)
                  FROM shoe_photos sp WHERE sp.shoe_id = s.id),
                 '[]'::json
               ) AS owner_photos
@@ -848,13 +848,21 @@ router.post('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
       for (let i = 0; i < photos.length; i++) {
         try {
           await db.query(
-            `INSERT INTO shoe_photos (shoe_id, url, caption, sort_order)
-             VALUES ($1, $2, $3, $4)`,
-            [createdShoe.id, photos[i], `Photo ${i + 1}`, i]
+            `INSERT INTO shoe_photos (shoe_id, url, caption, sort_order, is_cover, uploaded_by_role)
+             VALUES ($1, $2, $3, $4, $5, 'admin')`,
+            [createdShoe.id, photos[i], `Photo ${i + 1}`, i, i === 0]
           );
         } catch (e) {
-          console.warn('Photo save failed (idx ' + i + '):', e.message);
-          // Continue — don't fail entire registration over one photo
+          // Fallback for old schema without is_cover/uploaded_by_role columns
+          try {
+            await db.query(
+              `INSERT INTO shoe_photos (shoe_id, url, caption, sort_order)
+               VALUES ($1, $2, $3, $4)`,
+              [createdShoe.id, photos[i], `Photo ${i + 1}`, i]
+            );
+          } catch (e2) {
+            console.warn('Photo save failed (idx ' + i + '):', e2.message);
+          }
         }
       }
     }
@@ -1885,6 +1893,213 @@ router.post('/clean-bookings/:id/mark-delivered', requireRole('staff', 'admin'),
 
     res.json(rows[0]);
   } catch (err) { next(err); }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SHOE PHOTOS — add / delete / set cover (display photo)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GET all photos for a shoe (admin needs metadata like is_cover, uploaded_by_role)
+router.get('/shoes/:id/photos', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    let rows;
+    try {
+      const result = await db.query(
+        `SELECT id, url, caption, sort_order, is_cover, uploaded_by_role, uploaded_at
+         FROM shoe_photos
+         WHERE shoe_id = $1
+         ORDER BY is_cover DESC, sort_order ASC, uploaded_at ASC`,
+        [req.params.id]
+      );
+      rows = result.rows;
+    } catch (e) {
+      // Old schema fallback
+      const result = await db.query(
+        `SELECT id, url, caption, sort_order, uploaded_at
+         FROM shoe_photos
+         WHERE shoe_id = $1
+         ORDER BY sort_order ASC, uploaded_at ASC`,
+        [req.params.id]
+      );
+      rows = result.rows.map((r, i) => ({ ...r, is_cover: i === 0, uploaded_by_role: null }));
+    }
+    res.json(rows);
+  } catch (err) {
+    console.error('GET shoe photos error:', err);
+    next(err);
+  }
+});
+
+// POST add new photo(s) to a shoe
+router.post('/shoes/:id/photos', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { photos } = req.body; // array of base64 data URLs
+    if (!Array.isArray(photos) || !photos.length) {
+      return res.status(400).json({ error: 'No photos provided' });
+    }
+
+    // Verify shoe exists
+    const { rows: [shoe] } = await db.query(`SELECT id FROM shoes WHERE id = $1`, [req.params.id]);
+    if (!shoe) return res.status(404).json({ error: 'Shoe not found' });
+
+    // Determine current max sort_order so new photos go at the end
+    const { rows: [{ max_order }] } = await db.query(
+      `SELECT COALESCE(MAX(sort_order), -1) AS max_order FROM shoe_photos WHERE shoe_id = $1`,
+      [req.params.id]
+    );
+
+    // Check if shoe already has a cover; if not, the first new photo becomes cover
+    let hasCover = false;
+    try {
+      const { rows: coverCheck } = await db.query(
+        `SELECT 1 FROM shoe_photos WHERE shoe_id = $1 AND is_cover = TRUE LIMIT 1`,
+        [req.params.id]
+      );
+      hasCover = coverCheck.length > 0;
+    } catch (e) { /* old schema; skip */ }
+
+    const created = [];
+    let startOrder = parseInt(max_order) + 1;
+    for (let i = 0; i < photos.length; i++) {
+      const shouldBeCover = !hasCover && i === 0;
+      try {
+        const { rows } = await db.query(
+          `INSERT INTO shoe_photos (shoe_id, url, caption, sort_order, is_cover, uploaded_by_role)
+           VALUES ($1, $2, $3, $4, $5, 'admin')
+           RETURNING id, url, caption, sort_order, is_cover, uploaded_by_role`,
+          [req.params.id, photos[i], `Photo ${startOrder + i + 1}`, startOrder + i, shouldBeCover]
+        );
+        created.push(rows[0]);
+      } catch (e) {
+        // Old schema fallback
+        try {
+          const { rows } = await db.query(
+            `INSERT INTO shoe_photos (shoe_id, url, caption, sort_order)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, url, caption, sort_order`,
+            [req.params.id, photos[i], `Photo ${startOrder + i + 1}`, startOrder + i]
+          );
+          created.push(rows[0]);
+        } catch (e2) {
+          console.warn('Photo add failed:', e2.message);
+        }
+      }
+    }
+    res.json({ added: created.length, photos: created });
+  } catch (err) {
+    console.error('Add photos error:', err);
+    next(err);
+  }
+});
+
+// DELETE a single photo
+router.delete('/shoes/:shoeId/photos/:photoId', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    // Check if the photo being deleted is the cover — we'll need to re-assign cover after
+    let wasCover = false;
+    try {
+      const { rows } = await db.query(
+        `SELECT is_cover FROM shoe_photos WHERE id = $1 AND shoe_id = $2`,
+        [req.params.photoId, req.params.shoeId]
+      );
+      if (rows.length) wasCover = rows[0].is_cover;
+    } catch (e) { /* old schema */ }
+
+    const { rowCount } = await db.query(
+      `DELETE FROM shoe_photos WHERE id = $1 AND shoe_id = $2`,
+      [req.params.photoId, req.params.shoeId]
+    );
+    if (!rowCount) return res.status(404).json({ error: 'Photo not found' });
+
+    // If we just deleted the cover, promote the next-oldest photo to cover
+    if (wasCover) {
+      try {
+        await db.query(
+          `UPDATE shoe_photos SET is_cover = TRUE
+           WHERE id = (
+             SELECT id FROM shoe_photos
+             WHERE shoe_id = $1
+             ORDER BY sort_order ASC, uploaded_at ASC
+             LIMIT 1
+           )`,
+          [req.params.shoeId]
+        );
+      } catch (e) { /* old schema */ }
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Delete photo error:', err);
+    next(err);
+  }
+});
+
+// PATCH set a photo as the cover (display photo)
+router.patch('/shoes/:shoeId/photos/:photoId/cover', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    // Unset previous cover for this shoe, then set the new one — single transaction
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE shoe_photos SET is_cover = FALSE WHERE shoe_id = $1`,
+        [req.params.shoeId]
+      );
+      const { rowCount } = await client.query(
+        `UPDATE shoe_photos SET is_cover = TRUE
+         WHERE id = $1 AND shoe_id = $2`,
+        [req.params.photoId, req.params.shoeId]
+      );
+      if (!rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Photo not found' });
+      }
+      await client.query('COMMIT');
+      res.json({ ok: true });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Set cover error:', err);
+    res.status(500).json({ error: err.message || 'Could not set cover' });
+  }
+});
+
+// DELETE shoe (only allowed for pre-listed statuses to prevent accidental loss of live inventory)
+router.delete('/shoes/:id', requireRole('admin'), async (req, res, next) => {
+  try {
+    const { rows: [shoe] } = await db.query(
+      `SELECT id, status, brand, model, shoe_code FROM shoes WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!shoe) return res.status(404).json({ error: 'Shoe not found' });
+
+    // Protect listed/rented/sold shoes from deletion — use status override instead
+    const deletableStatuses = ['awaiting_approval','submitted','in_transit','authenticating','cleaning','rejected'];
+    if (!deletableStatuses.includes(shoe.status)) {
+      return res.status(409).json({
+        error: `Cannot delete a shoe with status "${shoe.status}". Use Reject or change status first.`,
+      });
+    }
+
+    // shoe_photos will cascade via ON DELETE CASCADE; submission_events too if configured
+    await db.query(`DELETE FROM shoes WHERE id = $1`, [req.params.id]);
+
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, 'shoe_deleted', 'shoe', $2, $3)`,
+      [req.user.id, req.params.id,
+       JSON.stringify({ brand: shoe.brand, model: shoe.model, shoe_code: shoe.shoe_code, prev_status: shoe.status })]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Delete shoe error:', err);
+    res.status(500).json({ error: err.message || 'Could not delete shoe' });
+  }
 });
 
 module.exports = router;
