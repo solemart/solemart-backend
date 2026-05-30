@@ -1,44 +1,24 @@
+// routes/postcodes.js
+// UK postcode validation + city/county autofill via postcodes.io (free).
+// Public — no auth required. Used by checkout, list-shoes, clean booking,
+// donation pickup and account profile forms.
+
 const express = require('express');
-const router  = express.Router();
+const router = express.Router();
+const { lookupPostcode } = require('../services/postcode');
 
 // GET /api/postcodes/:postcode
-// Proxies to postcodes.io — free, no API key needed
-// In production swap for Ideal Postcodes / GetAddress.io for richer data
-router.get('/:postcode', async (req, res, next) => {
+// Returns { valid: bool, postcode, city, county, region, country, ... }
+router.get('/:postcode', async (req, res) => {
   try {
-    const postcode = req.params.postcode.replace(/\s/g, '').toUpperCase();
-
-    const response = await fetch(
-      `${process.env.POSTCODE_API_URL || 'https://api.postcodes.io'}/postcodes/${encodeURIComponent(postcode)}`
-    );
-
-    if (!response.ok) {
-      if (response.status === 404) {
-        return res.status(404).json({ error: 'Postcode not found' });
-      }
-      throw new Error(`Postcode API returned ${response.status}`);
+    const result = await lookupPostcode(req.params.postcode);
+    if (!result.valid) {
+      return res.status(result.error === 'Postcode not recognised' ? 404 : 400).json(result);
     }
-
-    const data = await response.json();
-
-    // Normalise into address-like objects
-    // postcodes.io returns a single result — a real provider like GetAddress.io
-    // returns multiple addresses per postcode. This stub returns one address
-    // so the frontend select has something to work with.
-    const result = data.result;
-    const addresses = [
-      {
-        line1:   result.admin_ward || 'Address Line 1',
-        line2:   '',
-        city:    result.admin_district || result.parish || '',
-        county:  result.admin_county || result.european_electoral_region || '',
-        postcode: result.postcode,
-      },
-    ];
-
-    res.json({ postcode: result.postcode, addresses });
-  } catch (err) {
-    next(err);
+    res.json(result);
+  } catch (e) {
+    console.error('Postcode lookup error:', e);
+    res.status(500).json({ valid: false, error: 'Lookup failed' });
   }
 });
 
