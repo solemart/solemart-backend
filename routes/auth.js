@@ -85,6 +85,12 @@ router.post('/login', [
     );
 
     const user = rows[0];
+    // OAuth-only accounts have no password_hash — guide them to use their provider
+    if (user && !user.password_hash) {
+      return res.status(401).json({
+        error: `This account uses ${user.oauth_provider ? user.oauth_provider.charAt(0).toUpperCase()+user.oauth_provider.slice(1) : 'social'} sign-in. Please use that button to log in.`,
+      });
+    }
     if (!user || !(await bcrypt.compare(password, user.password_hash))) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
@@ -272,6 +278,159 @@ router.post('/reset-password', [
 
     res.json({ ok: true, message: 'Password reset successfully' });
   } catch (err) { next(err); }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  GOOGLE OAUTH (Sign in with Google)
+// ══════════════════════════════════════════════════════════════
+// Flow:
+//   1. Frontend calls GET /oauth/google/status → gets the consent URL
+//   2. Browser redirects to Google; user approves
+//   3. Google redirects to GET /oauth/google/callback?code=...
+//   4. We exchange the code for the user's identity, find-or-create
+//      the account, mint our normal tokens, and redirect back to the
+//      site with the tokens in the URL fragment.
+
+const GOOGLE_AUTH_URL  = 'https://accounts.google.com/o/oauth2/v2/auth';
+const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const GOOGLE_USERINFO  = 'https://www.googleapis.com/oauth2/v3/userinfo';
+
+const backendBase = () =>
+  process.env.BACKEND_URL || 'https://solemart-backend-production.up.railway.app';
+const frontendBase = () =>
+  process.env.APP_URL || 'https://beautifullyordered.co.uk';
+const googleRedirectUri = () => `${backendBase()}/api/auth/oauth/google/callback`;
+
+// GET /api/auth/oauth/google/status
+// Tells the frontend whether Google is configured + returns the consent URL.
+router.get('/oauth/google/status', (req, res) => {
+  const configured = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
+  if (!configured) return res.json({ configured: false });
+
+  const params = new URLSearchParams({
+    client_id:     process.env.GOOGLE_CLIENT_ID,
+    redirect_uri:  googleRedirectUri(),
+    response_type: 'code',
+    scope:         'openid email profile',
+    access_type:   'online',
+    prompt:        'select_account',
+  });
+  res.json({ configured: true, authUrl: `${GOOGLE_AUTH_URL}?${params.toString()}` });
+});
+
+// GET /api/auth/oauth/google/callback
+router.get('/oauth/google/callback', async (req, res) => {
+  const fail = (msg) =>
+    res.redirect(`${frontendBase()}/?oauth_error=${encodeURIComponent(msg)}`);
+
+  try {
+    const { code, error } = req.query;
+    if (error) return fail('Google sign-in was cancelled');
+    if (!code)  return fail('No authorization code received');
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+      return fail('Google sign-in is not configured');
+    }
+
+    // 1. Exchange the code for tokens
+    const tokenRes = await fetch(GOOGLE_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id:     process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri:  googleRedirectUri(),
+        grant_type:    'authorization_code',
+      }),
+    });
+    if (!tokenRes.ok) {
+      const t = await tokenRes.text().catch(() => '');
+      console.error('Google token exchange failed:', tokenRes.status, t);
+      return fail('Could not verify Google sign-in');
+    }
+    const tokens = await tokenRes.json();
+
+    // 2. Fetch the user's profile
+    const infoRes = await fetch(GOOGLE_USERINFO, {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    if (!infoRes.ok) return fail('Could not read Google profile');
+    const profile = await infoRes.json();
+    // profile: { sub, email, email_verified, given_name, family_name, name, picture }
+
+    const googleId   = profile.sub;
+    const email       = (profile.email || '').toLowerCase();
+    const emailVerified = profile.email_verified === true || profile.email_verified === 'true';
+    const firstName  = profile.given_name || (profile.name || 'Member').split(' ')[0];
+    const lastName   = profile.family_name || (profile.name || '').split(' ').slice(1).join(' ') || '';
+    const avatar     = profile.picture || null;
+
+    if (!email) return fail('Google did not provide an email');
+
+    // 3. Find or create the account
+    //    a) already linked by google id?
+    let user = null;
+    const byOauth = await db.query(
+      `SELECT * FROM users WHERE oauth_provider = 'google' AND oauth_id = $1`,
+      [googleId]
+    );
+    if (byOauth.rows.length) {
+      user = byOauth.rows[0];
+      // keep avatar fresh
+      if (avatar && avatar !== user.avatar_url) {
+        await db.query(`UPDATE users SET avatar_url = $1 WHERE id = $2`, [avatar, user.id]);
+      }
+    } else {
+      //    b) existing account with this email? → LINK (only if Google verified the email)
+      const byEmail = await db.query(`SELECT * FROM users WHERE email = $1`, [email]);
+      if (byEmail.rows.length) {
+        if (!emailVerified) {
+          return fail('Please sign in with your password to link Google to your account');
+        }
+        user = byEmail.rows[0];
+        await db.query(
+          `UPDATE users
+           SET oauth_provider = 'google', oauth_id = $1,
+               avatar_url = COALESCE($2, avatar_url),
+               email_verified = TRUE
+           WHERE id = $3`,
+          [googleId, avatar, user.id]
+        );
+      } else {
+        //  c) brand-new user
+        const ins = await db.query(
+          `INSERT INTO users (first_name, last_name, email, oauth_provider, oauth_id, avatar_url, email_verified)
+           VALUES ($1, $2, $3, 'google', $4, $5, TRUE)
+           RETURNING *`,
+          [firstName, lastName, email, googleId, avatar]
+        );
+        user = ins.rows[0];
+        // Welcome email (non-blocking)
+        emailService.sendWelcome(user).catch(() => {});
+      }
+    }
+
+    // 4. Mint our normal session tokens
+    const accessToken  = generateAccessToken(user);
+    const refreshToken = await generateRefreshToken(user.id);
+
+    // 5. Redirect back to the site with tokens in the URL fragment (#),
+    //    which never hits servers/logs. Frontend reads & stores them.
+    const frag = new URLSearchParams({
+      oauth: 'google',
+      access: accessToken,
+      refresh: refreshToken,
+      uid: user.id,
+      first: user.first_name || '',
+      last: user.last_name || '',
+      email: user.email,
+      role: user.role,
+    });
+    res.redirect(`${frontendBase()}/#${frag.toString()}`);
+  } catch (err) {
+    console.error('Google OAuth callback error:', err);
+    return fail('Sign-in failed, please try again');
+  }
 });
 
 module.exports = router;
