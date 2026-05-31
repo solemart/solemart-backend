@@ -176,16 +176,24 @@ router.post('/finalize-paid', async (req, res, next) => {
       stripe_session_id: session_id,
     }, null);
 
-    // Generate the prepaid label (placeholder until a carrier API is wired)
-    const labelUrl = await labelService.generateDonationLabel({
+    // Generate the prepaid label via Royal Mail (graceful fallback if not configured)
+    const labelResult = await labelService.generateDonationLabel({
       reference: donation.reference,
       donor: { name: donation.donor_name, email: donation.donor_email },
       collectionAddress: null,
       pairCount: donation.pair_count,
+      weightGrams: donation.estimated_weight ? Math.round(donation.estimated_weight * 1000) : null,
     }).catch(() => null);
 
+    const labelUrl = labelResult ? String(labelResult) : null;
+    const trackingNumber = labelResult && labelResult.trackingNumber ? labelResult.trackingNumber : null;
+    const rmOrderId = labelResult && labelResult.orderIdentifier ? String(labelResult.orderIdentifier) : null;
+
     if (labelUrl) {
-      await db.query('UPDATE donations SET label_url = $1 WHERE id = $2', [labelUrl, donation.id]);
+      await db.query(
+        'UPDATE donations SET label_url = $1, tracking_number = $2, rm_order_id = $3 WHERE id = $4',
+        [labelUrl, trackingNumber, rmOrderId, donation.id]
+      );
     }
 
     emailService.sendDonationConfirmation(
@@ -197,7 +205,7 @@ router.post('/finalize-paid', async (req, res, next) => {
       reference: donation.reference, shipping_fee: donation.shipping_fee,
     });
 
-    res.json({ donation: { ...donation, label_url: labelUrl } });
+    res.json({ donation: { ...donation, label_url: labelUrl, tracking_number: trackingNumber } });
   } catch (err) {
     console.error('Finalize paid donation error:', err);
     res.status(500).json({ error: err.message || 'Could not finalize' });

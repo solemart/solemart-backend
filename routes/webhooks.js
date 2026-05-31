@@ -145,16 +145,23 @@ router.post('/stripe', async (req, res) => {
             );
             const donation = rows[0];
 
-            // Generate prepaid label (placeholder service until carrier API wired)
-            let labelUrl = null;
+            // Generate prepaid label via Royal Mail (graceful fallback if not configured)
+            let labelUrl = null, trackingNumber = null, rmOrderId = null;
             try {
               const labelService = require('../services/label');
-              labelUrl = await labelService.generateDonationLabel({
+              const labelResult = await labelService.generateDonationLabel({
                 reference, donor: { name: m.donor_name, email: m.donor_email },
                 collectionAddress: null, pairCount: parseInt(m.pair_count) || 1,
+                weightGrams: m.estimated_weight ? Math.round(parseFloat(m.estimated_weight) * 1000) : null,
               });
+              labelUrl = labelResult ? String(labelResult) : null;
+              trackingNumber = labelResult && labelResult.trackingNumber ? labelResult.trackingNumber : null;
+              rmOrderId = labelResult && labelResult.orderIdentifier ? String(labelResult.orderIdentifier) : null;
               if (labelUrl) {
-                await db.query('UPDATE donations SET label_url = $1 WHERE id = $2', [labelUrl, donation.id]);
+                await db.query(
+                  'UPDATE donations SET label_url = $1, tracking_number = $2, rm_order_id = $3 WHERE id = $4',
+                  [labelUrl, trackingNumber, rmOrderId, donation.id]
+                );
               }
             } catch (e) { console.warn('Donation label gen failed:', e.message); }
 
