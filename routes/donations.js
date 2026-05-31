@@ -7,86 +7,203 @@ const labelService  = require('../services/label');
 const { logActivity } = require('../services/activityLog');
 const router        = express.Router();
 
+let stripe = null;
+try { stripe = require('stripe')(process.env.STRIPE_SECRET_KEY); }
+catch (e) { console.warn('Stripe not initialised in donations route:', e.message); }
+
 const genRef = () => {
   const rand = Math.random().toString(36).slice(2, 5).toUpperCase();
   return `DON-${rand}-${Date.now().toString().slice(-4)}`;
 };
 
-// ── POST /api/donations  (anyone can donate — no account needed) ──────────
+// Insert a donation row from a normalised payload. Returns the created row.
+async function insertDonation(payload, userId) {
+  const {
+    donor_name, donor_email, donor_phone,
+    shoe_description, pair_count, notes,
+    delivery_method = 'post', estimated_weight = null, shipping_fee = 0,
+    collection_line1, collection_line2,
+    collection_city, collection_county, collection_postcode,
+    stripe_session_id = null, shipping_paid = false,
+  } = payload;
+
+  const reference = genRef();
+  const { rows } = await db.query(
+    `INSERT INTO donations
+       (reference, donor_user_id, donor_name, donor_email, donor_phone,
+        shoe_description, pair_count, notes,
+        delivery_method, estimated_weight, shipping_fee, shipping_paid, stripe_session_id,
+        collection_line1, collection_line2, collection_city,
+        collection_county, collection_postcode)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+     RETURNING *`,
+    [
+      reference, userId || null,
+      donor_name, donor_email, donor_phone || null,
+      shoe_description, parseInt(pair_count), notes || null,
+      delivery_method, estimated_weight, shipping_fee || 0, shipping_paid, stripe_session_id,
+      collection_line1 || null, collection_line2 || null,
+      collection_city || null, collection_county || null, collection_postcode || null,
+    ]
+  );
+  return rows[0];
+}
+
+// ── POST /api/donations  (post-yourself OR free-collection — no payment) ──────
+// The paid-label path uses /checkout instead.
 router.post('/', optionalAuth, [
   body('donor_name').trim().notEmpty().withMessage('Name required'),
   body('donor_email').isEmail().normalizeEmail().withMessage('Valid email required'),
   body('shoe_description').trim().notEmpty().withMessage('Shoe description required'),
-  body('pair_count').isInt({ min: 1, max: 100 }).withMessage('Pair count must be 1–100'),
-  body('collection_line1').trim().notEmpty().withMessage('Collection address required'),
-  body('collection_postcode').trim().notEmpty().withMessage('Collection postcode required'),
+  body('pair_count').isInt({ min: 1, max: 200 }).withMessage('Pair count must be 1–200'),
 ], async (req, res, next) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(422).json({ errors: errors.array() });
 
-    const {
-      donor_name, donor_email, donor_phone,
-      shoe_description, pair_count, notes,
-      collection_line1, collection_line2,
-      collection_city, collection_county, collection_postcode,
-    } = req.body;
+    const method = req.body.delivery_method || 'post';
 
-    const reference = genRef();
+    // Free-collection path needs an address
+    if (method === 'collect' && (!req.body.collection_line1 || !req.body.collection_postcode)) {
+      return res.status(422).json({ error: 'Collection address required for collection requests' });
+    }
 
-    const { rows } = await db.query(
-      `INSERT INTO donations
-         (reference, donor_user_id, donor_name, donor_email, donor_phone,
-          shoe_description, pair_count, notes,
-          collection_line1, collection_line2, collection_city,
-          collection_county, collection_postcode)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-       RETURNING *`,
-      [
-        reference,
-        req.user?.id || null,
-        donor_name, donor_email, donor_phone || null,
-        shoe_description, parseInt(pair_count), notes || null,
-        collection_line1, collection_line2 || null,
-        collection_city || null, collection_county || null, collection_postcode,
-      ]
-    );
+    const donation = await insertDonation(req.body, req.user?.id);
 
-    const donation = rows[0];
-
-    // Generate collection label
-    const labelUrl = await labelService.generateDonationLabel({
-      reference,
-      donor: { name: donor_name, email: donor_email },
-      collectionAddress: {
-        line1: collection_line1, line2: collection_line2,
-        city: collection_city, county: collection_county,
-        postcode: collection_postcode,
-      },
-      pairCount: parseInt(pair_count),
-    });
-
-    await db.query(
-      'UPDATE donations SET label_url = $1 WHERE id = $2',
-      [labelUrl, donation.id]
-    );
-
-    // Send confirmation email with label
+    // Confirmation email (no label for post-yourself; collection is arranged manually)
     emailService.sendDonationConfirmation(
-      { name: donor_name, email: donor_email },
+      { name: donation.donor_name, email: donation.donor_email },
       donation,
-      labelUrl
+      null
     ).catch(console.error);
 
     await logActivity(req.user?.id || null, 'donation.submitted', 'donation', donation.id, {
-      reference, pair_count, donor_email,
+      reference: donation.reference, pair_count: donation.pair_count,
+      donor_email: donation.donor_email, method,
     });
 
-    res.status(201).json({
-      donation: { ...donation, label_url: labelUrl },
-    });
+    res.status(201).json({ donation });
   } catch (err) { next(err); }
 });
+
+// ── POST /api/donations/checkout  (paid prepaid-label path) ───────────────────
+// Donor pays the shipping fee; on success the donation is created + label generated.
+router.post('/checkout', optionalAuth, [
+  body('donor_name').trim().notEmpty(),
+  body('donor_email').isEmail().normalizeEmail(),
+  body('pair_count').isInt({ min: 1, max: 200 }),
+  body('shipping_fee').isFloat({ min: 0.5 }).withMessage('Invalid shipping fee'),
+], async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(422).json({ errors: errors.array() });
+    if (!stripe) return res.status(503).json({ error: 'Payment is not configured yet' });
+
+    const fee = parseFloat(req.body.shipping_fee);
+
+    // Stash the donation details in Stripe metadata so the webhook can create the
+    // donation record only after successful payment. Keep metadata compact.
+    const metaPayload = {
+      donor_name: req.body.donor_name,
+      donor_email: req.body.donor_email,
+      donor_phone: req.body.donor_phone || '',
+      shoe_description: req.body.shoe_description || '',
+      pair_count: String(req.body.pair_count),
+      estimated_weight: String(req.body.estimated_weight || ''),
+      shipping_fee: String(fee),
+      notes: (req.body.notes || '').slice(0, 480),
+    };
+
+    const successUrl = `${process.env.APP_URL || 'https://beautifullyordered.co.uk'}?donation_paid=1&ref={CHECKOUT_SESSION_ID}`;
+    const cancelUrl  = `${process.env.APP_URL || 'https://beautifullyordered.co.uk'}?page=donate`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'gbp',
+          product_data: {
+            name: 'Kosmos donation — prepaid shipping label',
+            description: `${req.body.pair_count} pairs · approx ${req.body.estimated_weight || '?'}kg`,
+          },
+          unit_amount: Math.round(fee * 100),
+        },
+        quantity: 1,
+      }],
+      metadata: { kind: 'donation', ...metaPayload },
+      payment_intent_data: { metadata: { kind: 'donation', ...metaPayload } },
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+    });
+
+    res.json({ checkout_url: session.url, session_id: session.id });
+  } catch (err) {
+    console.error('Donation checkout error:', err);
+    res.status(500).json({ error: err.message || 'Could not start payment' });
+  }
+});
+
+// ── POST /api/donations/finalize-paid  (called on Stripe return as a fallback) ─
+// The webhook is the source of truth, but this lets the client confirm + fetch
+// the label immediately on return. Idempotent on stripe_session_id.
+router.post('/finalize-paid', async (req, res, next) => {
+  try {
+    const { session_id } = req.body;
+    if (!session_id || !stripe) return res.status(400).json({ error: 'Missing session' });
+
+    // Already created? Return it.
+    const existing = await db.query(
+      `SELECT * FROM donations WHERE stripe_session_id = $1`, [session_id]
+    );
+    if (existing.rows.length) {
+      return res.json({ donation: existing.rows[0] });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    if (session.payment_status !== 'paid') {
+      return res.status(402).json({ error: 'Payment not completed' });
+    }
+
+    const m = session.metadata || {};
+    const donation = await insertDonation({
+      donor_name: m.donor_name, donor_email: m.donor_email, donor_phone: m.donor_phone,
+      shoe_description: m.shoe_description, pair_count: m.pair_count, notes: m.notes,
+      delivery_method: 'label',
+      estimated_weight: m.estimated_weight ? parseFloat(m.estimated_weight) : null,
+      shipping_fee: m.shipping_fee ? parseFloat(m.shipping_fee) : 0,
+      shipping_paid: true,
+      stripe_session_id: session_id,
+    }, null);
+
+    // Generate the prepaid label (placeholder until a carrier API is wired)
+    const labelUrl = await labelService.generateDonationLabel({
+      reference: donation.reference,
+      donor: { name: donation.donor_name, email: donation.donor_email },
+      collectionAddress: null,
+      pairCount: donation.pair_count,
+    }).catch(() => null);
+
+    if (labelUrl) {
+      await db.query('UPDATE donations SET label_url = $1 WHERE id = $2', [labelUrl, donation.id]);
+    }
+
+    emailService.sendDonationConfirmation(
+      { name: donation.donor_name, email: donation.donor_email },
+      donation, labelUrl
+    ).catch(console.error);
+
+    await logActivity(null, 'donation.paid', 'donation', donation.id, {
+      reference: donation.reference, shipping_fee: donation.shipping_fee,
+    });
+
+    res.json({ donation: { ...donation, label_url: labelUrl } });
+  } catch (err) {
+    console.error('Finalize paid donation error:', err);
+    res.status(500).json({ error: err.message || 'Could not finalize' });
+  }
+});
+
 
 // ── GET /api/donations  (admin — all donations) ───────────────────────────
 router.get('/', authenticate, requireRole('staff', 'admin'), async (req, res, next) => {
