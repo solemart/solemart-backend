@@ -2102,4 +2102,54 @@ router.delete('/shoes/:id', requireRole('admin'), async (req, res, next) => {
   }
 });
 
+// ──────────────────────────────────────────────────────────────────────────────
+// VERIFICATION — admin review of proof-of-address documents
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GET /api/admin/verifications — list users pending proof-of-address review
+router.get('/verifications', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, first_name, last_name, email,
+              id_verified, id_verified_at, id_verified_name,
+              address_proof_status, address_proof_extracted, address_verified,
+              address_proof_url
+       FROM users
+       WHERE address_proof_status IN ('pending','manual_review')
+       ORDER BY address_verified_at ASC NULLS FIRST, id ASC`
+    );
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
+// POST /api/admin/verifications/:userId/decide — approve or reject the address proof
+router.post('/verifications/:userId/decide', requireRole('staff', 'admin'), async (req, res, next) => {
+  try {
+    const { decision, notes } = req.body; // 'approve' | 'reject'
+    if (!['approve', 'reject'].includes(decision)) {
+      return res.status(400).json({ error: 'decision must be approve or reject' });
+    }
+    const approved = decision === 'approve';
+    const { rows } = await db.query(
+      `UPDATE users
+       SET address_verified = $1,
+           address_verified_at = CASE WHEN $1 THEN NOW() ELSE address_verified_at END,
+           address_proof_status = $2,
+           verification_notes = $3
+       WHERE id = $4
+       RETURNING id, first_name, last_name, email, id_verified, address_verified`,
+      [approved, approved ? 'approved' : 'rejected', notes || null, req.params.userId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    await db.query(
+      `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
+       VALUES ($1, $2, 'user', $3, $4)`,
+      [req.user.id, `address_${decision}d`, req.params.userId, JSON.stringify({ notes: notes || null })]
+    );
+
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
 module.exports = router;

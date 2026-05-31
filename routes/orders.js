@@ -32,6 +32,30 @@ router.post('/', authenticate, [
       delivery_city, delivery_county, delivery_postcode,
     } = req.body;
 
+    // RENTAL VERIFICATION GATE — a renter must be ID + address verified once.
+    // Enforced server-side so it can't be bypassed by tampering with the client.
+    if (order_type === 'rent') {
+      try {
+        const { rows: vRows } = await client.query(
+          `SELECT id_verified, address_verified FROM users WHERE id = $1`,
+          [req.user.id]
+        );
+        const v = vRows[0] || {};
+        if (!v.id_verified || !v.address_verified) {
+          return res.status(403).json({
+            error: 'verification_required',
+            message: 'Identity and address verification are required before renting.',
+            id_verified: v.id_verified || false,
+            address_verified: v.address_verified || false,
+          });
+        }
+      } catch (e) {
+        // If verification columns don't exist yet (migration not run), fail safe → block rental
+        console.warn('Verification check failed:', e.message);
+        return res.status(403).json({ error: 'verification_required', message: 'Verification system unavailable.' });
+      }
+    }
+
     // Fetch the shoe and verify it's available
     const { rows: shoeRows } = await client.query(
       'SELECT * FROM shoes WHERE id = $1',
