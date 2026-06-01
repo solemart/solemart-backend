@@ -303,10 +303,12 @@ const googleRedirectUri = () => `${backendBase()}/api/auth/oauth/google/callback
 
 // GET /api/auth/oauth/google/status
 // Tells the frontend whether Google is configured + returns the consent URL.
+// Pass ?client=app to have the callback redirect back to the mobile app scheme.
 router.get('/oauth/google/status', (req, res) => {
   const configured = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
   if (!configured) return res.json({ configured: false });
 
+  const isApp = req.query.client === 'app';
   const params = new URLSearchParams({
     client_id:     process.env.GOOGLE_CLIENT_ID,
     redirect_uri:  googleRedirectUri(),
@@ -314,14 +316,20 @@ router.get('/oauth/google/status', (req, res) => {
     scope:         'openid email profile',
     access_type:   'online',
     prompt:        'select_account',
+    state:         isApp ? 'app' : 'web',
   });
   res.json({ configured: true, authUrl: `${GOOGLE_AUTH_URL}?${params.toString()}` });
 });
 
 // GET /api/auth/oauth/google/callback
 router.get('/oauth/google/callback', async (req, res) => {
-  const fail = (msg) =>
-    res.redirect(`${frontendBase()}/?oauth_error=${encodeURIComponent(msg)}`);
+  const isApp = req.query.state === 'app';
+  const appScheme = process.env.APP_SCHEME || 'kosmos';
+  // Where to send the user back to: the mobile app (deep link) or the website.
+  const successBase = isApp ? `${appScheme}://oauth` : `${frontendBase()}/#`;
+  const fail = (msg) => isApp
+    ? res.redirect(`${appScheme}://oauth?oauth_error=${encodeURIComponent(msg)}`)
+    : res.redirect(`${frontendBase()}/?oauth_error=${encodeURIComponent(msg)}`);
 
   try {
     const { code, error } = req.query;
@@ -414,9 +422,10 @@ router.get('/oauth/google/callback', async (req, res) => {
     const accessToken  = generateAccessToken(user);
     const refreshToken = await generateRefreshToken(user.id);
 
-    // 5. Redirect back to the site with tokens in the URL fragment (#),
-    //    which never hits servers/logs. Frontend reads & stores them.
-    const frag = new URLSearchParams({
+    // 5. Redirect back with tokens. Website uses the URL fragment (#) so tokens
+    //    never hit logs; the app uses its custom scheme (kosmos://oauth?...).
+    //    For the app we use a query string because expo-linking parses query params.
+    const params = new URLSearchParams({
       oauth: 'google',
       access: accessToken,
       refresh: refreshToken,
@@ -426,7 +435,11 @@ router.get('/oauth/google/callback', async (req, res) => {
       email: user.email,
       role: user.role,
     });
-    res.redirect(`${frontendBase()}/#${frag.toString()}`);
+    if (isApp) {
+      res.redirect(`${appScheme}://oauth?${params.toString()}`);
+    } else {
+      res.redirect(`${frontendBase()}/#${params.toString()}`);
+    }
   } catch (err) {
     console.error('Google OAuth callback error:', err);
     return fail('Sign-in failed, please try again');
