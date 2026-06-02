@@ -63,7 +63,7 @@ router.get('/queue', async (req, res, next) => {
     }
 
     // Submissions = anything pre-listing (not yet on the catalogue)
-    let where = `s.status IN ('awaiting_approval','submitted','in_transit','authenticating','cleaning','rejected')`;
+    let where = `s.status IN ('awaiting_approval','submitted','in_transit','authenticating','inspection','cleaning','rejected')`;
     if (stage && stage !== 'all') where = `s.status = '${stage}'`;
 
     const { rows: shoeSubmissions } = await db.query(
@@ -913,17 +913,21 @@ router.get('/shoes/by-code/:code', requireRole('staff', 'admin'), async (req, re
   } catch (err) { next(err); }
 });
 
-// POST /api/admin/shoes/:id/return-review — admin marks a rental returned + decides next stage
-// Pass → cleaning sub-tab (will be cleaned then re-listed)
-// Fail → rejected sub-tab (owner notified)
+// POST /api/admin/shoes/:id/return-review — scan a returned rental's QR
+// Moves the shoe into the INSPECTION (Review) stage and requests a customer review.
+// outcome 'pass'  → shoe to 'inspection' (staff inspect, then clean → re-list)
+// outcome 'fail'  → shoe to 'rejected' (owner notified)
+// If no outcome is given, default to 'pass' (the normal return-and-inspect path).
 router.post('/shoes/:id/return-review', requireRole('staff', 'admin'), async (req, res, next) => {
   const client = await db.connect();
   try {
-    const { outcome, notes } = req.body;
+    const outcome = req.body.outcome || 'pass';
+    const notes = req.body.notes;
     if (!['pass', 'fail'].includes(outcome)) {
       return res.status(400).json({ error: 'Outcome must be pass or fail' });
     }
-    const newStatus = outcome === 'pass' ? 'cleaning' : 'rejected';
+    // 'pass' returns go to inspection (the new Review stage); 'fail' goes to rejected
+    const newStatus = outcome === 'pass' ? 'inspection' : 'rejected';
 
     await client.query('BEGIN');
 
@@ -939,46 +943,52 @@ router.post('/shoes/:id/return-review', requireRole('staff', 'admin'), async (re
       return res.status(404).json({ error: 'Shoe not found' });
     }
 
-    // 2. Mark any active rental as completed/returned
+    // 2. Mark the active rental returned + request a customer review
     let updatedOrderId = null;
+    let reviewCustomerId = null;
+    let reviewOrderRef = null;
     const { rows: activeOrders } = await client.query(
-      `SELECT id, reference, status FROM orders
+      `SELECT id, reference, customer_id, status FROM orders
        WHERE shoe_id = $1
-         AND status IN ('confirmed','dispatched','delivered','active_rental','returned','return_requested')
+         AND status IN ('confirmed','dispatched','delivered','active_rental','return_initiated','returned')
        ORDER BY created_at DESC
        LIMIT 1`,
       [req.params.id]
     );
     if (activeOrders.length) {
       updatedOrderId = activeOrders[0].id;
+      reviewCustomerId = activeOrders[0].customer_id;
+      reviewOrderRef = activeOrders[0].reference;
+      // Move the order into 'inspection' and stamp the review request.
       await client.query(
-        `UPDATE orders SET status = 'completed', actual_return_date = NOW(), updated_at = NOW()
-         WHERE id = $1`,
-        [updatedOrderId]
+        `UPDATE orders
+         SET status = $1, actual_return_date = NOW(),
+             review_requested_at = COALESCE(review_requested_at, NOW()),
+             updated_at = NOW()
+         WHERE id = $2`,
+        [outcome === 'pass' ? 'inspection' : 'returned', updatedOrderId]
       );
     }
 
-    // 3. Update shoe status
+    // 3. Update shoe status → inspection (or rejected)
     await client.query(
       `UPDATE shoes SET status = $1, updated_at = NOW() WHERE id = $2`,
       [newStatus, req.params.id]
     );
 
-    // 4. Log to submission_events timeline (visible to owner)
+    // 4. Owner-visible timeline note
     try {
       const ownerNotes = outcome === 'pass'
-        ? `Returned in good condition — sent to cleaning. ${notes || ''}`.trim()
+        ? `Returned and received — now under inspection. ${notes || ''}`.trim()
         : `Returned with issues — rejected. ${notes || ''}`.trim();
       await client.query(
         `INSERT INTO submission_events (shoe_id, event_type, status_after, actor_id, actor_role, notes, visible_to_owner)
          VALUES ($1, $2, $3, $4, 'kosmos', $5, TRUE)`,
         [req.params.id, `return_${outcome}`, newStatus, req.user.id, ownerNotes]
       );
-    } catch (e) {
-      // Table optional on older schemas — non-fatal
-    }
+    } catch (e) { /* optional table */ }
 
-    // 5. Log to activity feed
+    // 5. Activity feed
     await client.query(
       `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
        VALUES ($1, $2, 'shoe', $3, $4)`,
@@ -988,11 +998,24 @@ router.post('/shoes/:id/return-review', requireRole('staff', 'admin'), async (re
 
     await client.query('COMMIT');
 
+    // 6. Email the customer a review request (non-blocking, outside the txn)
+    if (outcome === 'pass' && reviewCustomerId) {
+      (async () => {
+        try {
+          const { rows: cust } = await db.query(`SELECT * FROM users WHERE id = $1`, [reviewCustomerId]);
+          if (cust[0] && emailService.sendReviewRequest) {
+            emailService.sendReviewRequest(cust[0], shoe, reviewOrderRef).catch(() => {});
+          }
+        } catch {}
+      })();
+    }
+
     res.json({
       ok: true,
       shoe_id: req.params.id,
       order_id: updatedOrderId,
       new_status: newStatus,
+      review_requested: outcome === 'pass' && !!reviewCustomerId,
       outcome,
     });
   } catch (err) {

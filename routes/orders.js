@@ -123,14 +123,25 @@ router.post('/', authenticate, [
 
     await client.query('BEGIN');
 
-    // Reserve the allocated shoe
+    // Reserve the allocated shoe during checkout. It becomes 'reserved' (held)
+    // — NOT yet rented/sold. The order row is created only once payment is
+    // confirmed (in the webhook). If payment fails/expires, the shoe is released
+    // back to 'listed'. This guarantees the Orders tab only ever shows paid orders.
     await client.query(
-      `UPDATE shoes SET status = $1, updated_at = NOW() WHERE id = $2`,
-      [order_type === 'rent' ? 'rented' : 'sold', allocatedShoeId]
+      `UPDATE shoes SET status = 'reserved', updated_at = NOW() WHERE id = $1`,
+      [allocatedShoeId]
     );
 
-    // Create Stripe payment intent (optional — only if Stripe is configured)
-    let paymentIntent = { id: null, client_secret: null };
+    // Payment is mandatory — without Stripe we cannot confirm payment, and we
+    // never create unpaid orders. Fail clearly if Stripe isn't configured.
+    if (!process.env.STRIPE_SECRET_KEY) {
+      await client.query(`UPDATE shoes SET status = 'listed', updated_at = NOW() WHERE id = $1 AND status = 'reserved'`, [allocatedShoeId]);
+      await client.query('ROLLBACK');
+      return res.status(503).json({ error: 'Payments are temporarily unavailable. Please try again shortly.' });
+    }
+
+    // Create Stripe payment intent
+    let paymentIntent = { id: null, client_secret: null, reference: null };
     let stripeCustomerId = null;
     let ephemeralKeySecret = null;
     if (process.env.STRIPE_SECRET_KEY) {
@@ -164,13 +175,40 @@ router.post('/', authenticate, [
         );
         const ownerStripeId = ownerRows[0]?.stripe_account_id;
 
-        // Create payment intent with Customer attached so card is saved for later
+        // Generate the order reference now so it travels in the PI metadata and
+        // the webhook can create the order row with it once payment confirms.
+        const reference = genRef('ORD');
+        const rentalStart = order_type === 'rent' ? new Date() : null;
+        const rentalEnd   = order_type === 'rent'
+          ? new Date(Date.now() + rental_days * 86400000) : null;
+
+        // ALL order details live in PI metadata. No order row is created here —
+        // the webhook builds it on payment_intent.succeeded, so the Orders tab
+        // only ever contains paid orders. (Stripe metadata values must be strings.)
         const piParams = {
           amount: Math.round(total * 100),
           currency: 'gbp',
           customer: stripeCustomerId,
           setup_future_usage: order_type === 'rent' ? 'off_session' : undefined,
-          metadata: { shoe_id: allocatedShoeId, order_type, customer_id: req.user.id },
+          metadata: {
+            kind: 'order',
+            reference,
+            shoe_id: allocatedShoeId,
+            order_type,
+            customer_id: req.user.id,
+            unit_price: String(unitPrice),
+            rental_days: rental_days ? String(rental_days) : '',
+            subtotal: String(subtotal),
+            platform_fee: String(platformFee),
+            total: String(total),
+            delivery_line1: delivery_line1 || '',
+            delivery_line2: delivery_line2 || '',
+            delivery_city: delivery_city || '',
+            delivery_county: delivery_county || '',
+            delivery_postcode: delivery_postcode || '',
+            rental_start: rentalStart ? rentalStart.toISOString() : '',
+            rental_end: rentalEnd ? rentalEnd.toISOString() : '',
+          },
           automatic_payment_methods: { enabled: true },
         };
 
@@ -187,7 +225,7 @@ router.post('/', authenticate, [
         }
 
         const pi = await stripe.paymentIntents.create(piParams);
-        paymentIntent = { id: pi.id, client_secret: pi.client_secret };
+        paymentIntent = { id: pi.id, client_secret: pi.client_secret, reference };
 
         // Create ephemeral key for Payment Sheet
         const ephemeralKey = await stripe.ephemeralKeys.create(
@@ -196,50 +234,24 @@ router.post('/', authenticate, [
         );
         ephemeralKeySecret = ephemeralKey.secret;
       } catch (e) {
-        console.warn('Stripe payment intent failed (continuing without):', e.message);
+        console.warn('Stripe payment intent failed:', e.message);
+        // Release the shoe we reserved, since checkout can't proceed
+        await client.query(`UPDATE shoes SET status = 'listed', updated_at = NOW() WHERE id = $1 AND status = 'reserved'`, [allocatedShoeId]);
+        await client.query('ROLLBACK');
+        return res.status(502).json({ error: 'Could not start payment. Please try again.' });
       }
     }
 
-    const reference = genRef('ORD');
-    const rentalStart = order_type === 'rent' ? new Date() : null;
-    const rentalEnd   = order_type === 'rent'
-      ? new Date(Date.now() + rental_days * 86400000) : null;
-
-    const { rows } = await client.query(
-      `INSERT INTO orders
-         (reference, customer_id, shoe_id, order_type, status,
-          unit_price, rental_days, subtotal, platform_fee, total,
-          delivery_line1, delivery_line2, delivery_city, delivery_county, delivery_postcode,
-          stripe_payment_intent_id, rental_start_date, rental_end_date)
-       VALUES ($1,$2,$3,$4,'confirmed',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-       RETURNING *`,
-      [
-        reference, req.user.id, allocatedShoeId, order_type,
-        unitPrice, rental_days || null, subtotal, platformFee, total,
-        delivery_line1, delivery_line2 || null,
-        delivery_city || null, delivery_county || null, delivery_postcode,
-        paymentIntent.id,
-        rentalStart, rentalEnd,
-      ]
-    );
-
-    // Increment listing lifecycle count
-    await client.query(
-      `UPDATE shoes SET rental_count = rental_count + $1, updated_at = NOW() WHERE id = $2`,
-      [order_type === 'rent' ? 1 : 0, allocatedShoeId]
-    );
-
     await client.query('COMMIT');
 
-    await logActivity(req.user.id, 'order.created', 'order', rows[0].id, {
-      reference, order_type, total,
+    await logActivity(req.user.id, 'checkout.started', 'shoe', allocatedShoeId, {
+      reference: paymentIntent.reference, order_type, total,
     });
 
-    emailService.sendOrderConfirmation(req.user, rows[0], shoe).catch(console.error);
+    // NB: confirmation email is sent by the webhook once payment actually succeeds.
 
     res.status(201).json({
-      order: rows[0],
-      reference: rows[0].reference,
+      reference: paymentIntent.reference,
       client_secret: paymentIntent.client_secret,
       customer_id: stripeCustomerId,
       ephemeral_key: ephemeralKeySecret,

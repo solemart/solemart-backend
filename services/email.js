@@ -118,6 +118,19 @@ const sendReturnInitiated = (user, order) => send(
   `)}</div>`
 );
 
+// Sent when a returned rental is received & scanned — asks the renter to review.
+const sendReviewRequest = (user, shoe, orderReference) => send(
+  user.email,
+  `How were your ${shoe.brand} ${shoe.model}?`,
+  `<div style="${baseStyle}">${card(`
+    ${h1('How did we do?')}
+    ${p(`Hi ${user.first_name}, thanks for returning the ${shoe.emoji || ''} ${shoe.brand} ${shoe.model}. We'd love to hear how your rental went — your review helps other members and the shoe's owner.`)}
+    ${orderReference ? ref(orderReference) : ''}
+    ${p('It only takes a moment, and it makes a real difference.')}
+    ${btn('Leave a Review', `https://beautifullyordered.co.uk/?page=account&tab=orders`)}
+  `)}</div>`
+);
+
 const sendSubmissionConfirmation = (user, submission, shoes, labelUrl) => send(
   user.email,
   `Submission received — ${submission.reference}`,
@@ -263,6 +276,7 @@ module.exports = {
   sendOrderConfirmation,
   sendOrderDispatched,
   sendReturnInitiated,
+  sendReviewRequest,
   sendSubmissionConfirmation,
   sendShoeListed,
   sendShoeRejected,

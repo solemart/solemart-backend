@@ -274,29 +274,32 @@ router.post('/checkout', authenticate, async (req, res, next) => {
       await db.query(`UPDATE users SET stripe_customer_id = $1 WHERE id = $2`, [customerId, req.user.id]);
     }
 
-    // Create orders with status 'pending_payment'
-    const orderIds = [];
-    for (const o of orderInputs) {
-      const reference = 'ORD-' + Math.random().toString(36).slice(2, 5).toUpperCase() + '-' + Date.now().toString().slice(-4);
-      const rentalEnd = o.item.order_type === 'rent'
-        ? new Date(Date.now() + o.item.rental_days * 86400000) : null;
+    // Reserve the shoes (status → 'reserved') so they can't be double-sold during
+    // checkout, and stash the full order payload in the Checkout session metadata.
+    // The order rows are created by the webhook on checkout.session.completed —
+    // so the Orders tab only ever contains PAID orders. If the customer abandons
+    // checkout, a webhook (checkout.session.expired) releases the shoes.
+    const orderPayload = orderInputs.map(o => ({
+      sid: o.shoe.id,
+      ot: o.item.order_type,
+      up: o.unitPrice,
+      rd: o.item.order_type === 'rent' ? o.item.rental_days : null,
+      st: o.subtotal,
+      pf: o.platformFee,
+      tot: o.total,
+    }));
 
-      const { rows } = await db.query(
-        `INSERT INTO orders
-          (reference, customer_id, shoe_id, order_type, status,
-           unit_price, rental_days, subtotal, platform_fee, total,
-           delivery_line1, delivery_line2, delivery_city, delivery_postcode,
-           rental_start_date, rental_end_date)
-         VALUES ($1,$2,$3,$4,'pending_payment',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-         RETURNING id`,
-        [reference, req.user.id, o.shoe.id, o.item.order_type, o.unitPrice,
-         o.item.order_type === 'rent' ? o.item.rental_days : null,
-         o.subtotal, o.platformFee, o.total,
-         delivery.line1, delivery.line2 || null, delivery.city || 'London', delivery.postcode,
-         o.item.order_type === 'rent' ? new Date() : null, rentalEnd]
+    // Reserve each shoe now
+    for (const o of orderInputs) {
+      await db.query(
+        `UPDATE shoes SET status = 'reserved', updated_at = NOW() WHERE id = $1 AND status = 'listed'`,
+        [o.shoe.id]
       );
-      orderIds.push(rows[0].id);
     }
+
+    const deliveryMeta = JSON.stringify({
+      l1: delivery.line1, l2: delivery.line2 || '', c: delivery.city || 'London', pc: delivery.postcode,
+    });
 
     const successUrl = `${process.env.APP_URL || 'https://beautifullyordered.co.uk'}?stripe=success&session_id={CHECKOUT_SESSION_ID}`;
     const cancelUrl = `${process.env.APP_URL || 'https://beautifullyordered.co.uk'}?stripe=cancel`;
@@ -315,11 +318,17 @@ router.post('/checkout', authenticate, async (req, res, next) => {
         const deliveryPence  = Math.round(deliveryFee * 100);
         paymentIntentExtras = {
           transfer_data: { destination: owner.stripe_account_id, amount: ownerPence },
-          // Kosmos keeps: platform fee + cleaning + delivery (delivery covers shipping cost)
           application_fee_amount: platformPence + cleaningPence + deliveryPence,
         };
       }
     }
+
+    const sessionMeta = {
+      kind: 'order',
+      user_id: req.user.id,
+      orders: JSON.stringify(orderPayload),   // compact; fits 500-char limit for typical carts
+      delivery: deliveryMeta,
+    };
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -330,11 +339,12 @@ router.post('/checkout', authenticate, async (req, res, next) => {
       payment_intent_data: {
         ...paymentIntentExtras,
         ...(hasRental ? { setup_future_usage: 'off_session' } : {}),
-        metadata: { order_ids: orderIds.join(','), user_id: req.user.id },
+        metadata: sessionMeta,
       },
       success_url: successUrl,
       cancel_url: cancelUrl,
-      metadata: { order_ids: orderIds.join(','), user_id: req.user.id },
+      expires_at: Math.floor(Date.now() / 1000) + 30 * 60, // 30-min window
+      metadata: sessionMeta,
     });
 
     res.json({ checkout_url: session.url, session_id: session.id });
@@ -349,17 +359,18 @@ router.get('/checkout/verify', authenticate, async (req, res, next) => {
     const { stripe } = require('../services/stripe');
     const session = await stripe.checkout.sessions.retrieve(session_id);
     const paid = session.payment_status === 'paid';
-    // Update orders to confirmed if paid
-    if (paid && session.metadata?.order_ids) {
-      const orderIds = session.metadata.order_ids.split(',');
-      for (const id of orderIds) {
-        await db.query(
-          `UPDATE orders SET status = 'confirmed', stripe_payment_intent_id = $1 WHERE id = $2`,
-          [session.payment_intent, id]
-        );
-      }
+    // Orders are created by the checkout.session.completed webhook — we just
+    // report status here so the success page can show the right message.
+    // Look up the created order(s) by payment intent for the reference, if ready.
+    let reference = null;
+    if (paid && session.payment_intent) {
+      const { rows } = await db.query(
+        `SELECT reference FROM orders WHERE stripe_payment_intent_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [session.payment_intent]
+      );
+      reference = rows[0]?.reference || null;
     }
-    res.json({ paid, status: session.payment_status });
+    res.json({ paid, status: session.payment_status, reference });
   } catch (err) { next(err); }
 });
 
