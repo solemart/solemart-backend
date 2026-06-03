@@ -111,6 +111,8 @@ app.get('/api/config', async (req, res) => {
       rental_default_days:     all.rental_default_days,
       delivery_fee_amount:     all.delivery_fee_amount,
       free_delivery_threshold: all.free_delivery_threshold,
+      listing_label_fee:           all.listing_label_fee || '4.99',
+      listing_label_charge_method: all.listing_label_charge_method || 'payout_deduction',
     });
   } catch (e) { res.json({}); }
 });

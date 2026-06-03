@@ -22,8 +22,7 @@ router.post('/', authenticate, [
   body('shoes.*.model').trim().notEmpty(),
   body('shoes.*.size').trim().notEmpty(),
   body('shoes.*.listing_type').isIn(['rent','buy','both']),
-  body('collection_line1').trim().notEmpty().withMessage('Collection address required'),
-  body('collection_postcode').trim().notEmpty().withMessage('Collection postcode required'),
+  body('delivery_method').optional().isIn(['post','label']),
   body('referral_source').optional().trim(),
 ], async (req, res, next) => {
   const client = await db.getClient();
@@ -37,6 +36,31 @@ router.post('/', authenticate, [
       collection_city, collection_county, collection_postcode,
       referral_source, referral_other,
     } = req.body;
+    const deliveryMethod = req.body.delivery_method === 'label' ? 'label' : 'post';
+    const estimatedWeight = req.body.estimated_weight ? parseFloat(req.body.estimated_weight) : null;
+
+    // Prepaid label: compute the fee from the estimated weight (server-side, not
+    // trusting the client) using the same tiers as donations. Charge method is
+    // admin-controlled.
+    const settings = require('../services/settings');
+    function listingShippingFee(kg){
+      if(kg == null) return 0;
+      if(kg <= 2)  return 5.95;
+      if(kg <= 5)  return 8.95;
+      if(kg <= 10) return 12.95;
+      if(kg <= 15) return 16.95;
+      if(kg <= 20) return 20.95;
+      return 20.95 + Math.ceil((kg - 20) / 5) * 4;
+    }
+    let labelFee = 0;
+    let chargeMethod = 'payout_deduction';
+    if (deliveryMethod === 'label') {
+      labelFee = estimatedWeight != null
+        ? listingShippingFee(estimatedWeight)
+        : await settings.getListingLabelFee();   // fallback to flat fee if no weight
+      chargeMethod = await settings.getListingLabelChargeMethod();
+    }
+    const feeDeducted = false; // becomes true once actually netted from a payout
 
     await client.query('BEGIN');
 
@@ -46,12 +70,14 @@ router.post('/', authenticate, [
       `INSERT INTO listing_submissions
          (reference, owner_id, collection_line1, collection_line2,
           collection_city, collection_county, collection_postcode,
-          referral_source, referral_other)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          referral_source, referral_other,
+          delivery_method, label_fee, fee_deducted, estimated_weight)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING *`,
-      [reference, req.user.id, collection_line1, collection_line2 || null,
-       collection_city || null, collection_county || null, collection_postcode,
-       referral_source || null, referral_other || null]
+      [reference, req.user.id, collection_line1 || null, collection_line2 || null,
+       collection_city || null, collection_county || null, collection_postcode || null,
+       referral_source || null, referral_other || null,
+       deliveryMethod, labelFee, feeDeducted, estimatedWeight]
     );
     const submission = subRows[0];
 
