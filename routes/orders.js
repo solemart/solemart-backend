@@ -303,7 +303,7 @@ router.get('/:id', authenticate, async (req, res, next) => {
   }
 });
 
-// ── POST /api/orders/:id/return  (customer initiates return) ──
+// ── POST /api/orders/:id/return  (customer initiates a return — rental OR purchase) ──
 router.post('/:id/return', authenticate, async (req, res, next) => {
   const client = await db.getClient();
   try {
@@ -314,26 +314,28 @@ router.post('/:id/return', authenticate, async (req, res, next) => {
     if (!rows.length) return res.status(404).json({ error: 'Order not found' });
     const order = rows[0];
 
-    if (!['active_rental','delivered'].includes(order.status)) {
-      return res.status(409).json({ error: 'Order is not in a returnable state' });
+    // Rentals can be returned while active/delivered; purchases while in fulfilment/delivered.
+    const returnable = order.order_type === 'rent'
+      ? ['active_rental','delivered'].includes(order.status)
+      : ['cleaning','dispatched','delivered'].includes(order.status);
+    if (!returnable) {
+      return res.status(409).json({ error: 'This order is not in a returnable state' });
     }
 
     await client.query('BEGIN');
+    // Flag the order as return-initiated. We do NOT change the shoe's status here —
+    // the shoe is still physically with the customer. It moves to the Reviewing tab
+    // only when staff scan its QR on arrival (return-review endpoint).
     await client.query(
       `UPDATE orders SET status = 'return_initiated', updated_at = NOW() WHERE id = $1`,
       [order.id]
     );
-    // Shoe goes back to cleaning state
-    await client.query(
-      `UPDATE shoes SET status = 'cleaning', updated_at = NOW() WHERE id = $1`,
-      [order.shoe_id]
-    );
     await client.query('COMMIT');
 
-    await logActivity(req.user.id, 'order.return_initiated', 'order', order.id);
+    await logActivity(req.user.id, 'order.return_initiated', 'order', order.id, { order_type: order.order_type });
     emailService.sendReturnInitiated(req.user, order).catch(console.error);
 
-    res.json({ message: 'Return initiated. Check your email for the return label.' });
+    res.json({ message: 'Return initiated. Check your email for the return label and instructions.' });
   } catch (err) {
     await client.query('ROLLBACK');
     next(err);
