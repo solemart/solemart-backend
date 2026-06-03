@@ -29,12 +29,17 @@ const PORT = process.env.PORT || 3001;
 // Trust the platform proxy (Railway) so req.protocol reflects the real scheme.
 app.set('trust proxy', 1);
 
-// Force HTTPS in production: if a request somehow arrives over plain HTTP,
+// Force HTTPS in production: if a request DEFINITELY arrives over plain HTTP,
 // redirect it to HTTPS so credentials/PII are never sent in clear text.
+// We only redirect when x-forwarded-proto is explicitly "http" — never when the
+// header is missing/ambiguous (avoids redirect loops + spurious null origins on
+// proxied API calls). OPTIONS preflight requests are passed straight through.
 if (process.env.NODE_ENV === 'production') {
   app.use((req, res, next) => {
-    const proto = req.headers['x-forwarded-proto'] || req.protocol;
-    if (proto !== 'https') {
+    if (req.method === 'OPTIONS') return next();
+    // header may be a comma-separated list ("https,http") — take the first hop
+    const fwd = (req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+    if (fwd === 'http') {
       return res.redirect(301, 'https://' + req.headers.host + req.originalUrl);
     }
     next();
@@ -62,16 +67,16 @@ const allowedOrigins = [
 ];
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow mobile app requests (no origin) and allowed domains
-    if (!origin || allowedOrigins.includes(origin)) {
+    // Allow requests with no browser origin: native app, server-to-server,
+    // and the literal string "null" that browsers send after a redirect or
+    // from privacy-sandboxed contexts.
+    if (!origin || origin === 'null' || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else if (/^https:\/\/.*\.netlify\.app$/.test(origin)) {
+      // Any *.netlify.app preview URL
       callback(null, true);
     } else {
-      // Also allow any *.netlify.app preview URL
-      if (/^https:\/\/.*\.netlify\.app$/.test(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS: ' + origin));
-      }
+      callback(new Error('Not allowed by CORS: ' + origin));
     }
   },
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
