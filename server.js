@@ -25,7 +25,32 @@ const errorHandler = require('./middleware/errorHandler');
 const logger = require('./config/logger');
 const app = express();
 const PORT = process.env.PORT || 3001;
-app.use(helmet({ crossOriginResourcePolicy: false }));
+
+// Trust the platform proxy (Railway) so req.protocol reflects the real scheme.
+app.set('trust proxy', 1);
+
+// Force HTTPS in production: if a request somehow arrives over plain HTTP,
+// redirect it to HTTPS so credentials/PII are never sent in clear text.
+if (process.env.NODE_ENV === 'production') {
+  app.use((req, res, next) => {
+    const proto = req.headers['x-forwarded-proto'] || req.protocol;
+    if (proto !== 'https') {
+      return res.redirect(301, 'https://' + req.headers.host + req.originalUrl);
+    }
+    next();
+  });
+}
+
+// Security headers, including a strong HSTS policy (2 years, include subdomains,
+// preload) telling browsers to only ever connect to us over HTTPS.
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  hsts: {
+    maxAge: 63072000,        // 2 years
+    includeSubDomains: true,
+    preload: true,
+  },
+}));
 const allowedOrigins = [
   'https://beautifullyordered.co.uk',
   'https://www.beautifullyordered.co.uk',
