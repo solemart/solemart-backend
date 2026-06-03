@@ -83,6 +83,20 @@ router.post('/', authenticate, [
         [submission.id, createdShoe.id]
       );
 
+      // Save any owner-uploaded photos (base64 data URLs). First photo = cover.
+      if (Array.isArray(shoe.photos) && shoe.photos.length) {
+        let order = 0;
+        for (const dataUrl of shoe.photos.slice(0, 8)) {
+          if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image')) continue;
+          await client.query(
+            `INSERT INTO shoe_photos (shoe_id, url, sort_order, is_cover, uploaded_by_role)
+             VALUES ($1, $2, $3, $4, 'owner')`,
+            [createdShoe.id, dataUrl, order, order === 0]
+          );
+          order++;
+        }
+      }
+
       // Log first event in the submission timeline
       await client.query(
         `INSERT INTO submission_events (shoe_id, event_type, status_after, actor_id, actor_role, notes)
