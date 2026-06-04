@@ -445,15 +445,29 @@ router.patch('/shoes/:id', requireRole('staff', 'admin'), async (req, res, next)
     const { rows: [before] } = await db.query(`SELECT * FROM shoes WHERE id = $1`, [req.params.id]);
     if (!before) return res.status(404).json({ error: 'Shoe not found' });
 
-    // Generate a KSM code on first listing if missing
+    // Generate a KSM code on first listing if missing.
+    // Defensive: a failure here must NOT abort the listing. Previously an error
+    // in the shoeCodes service threw and 500'd the whole PATCH, so the shoe never
+    // flipped to 'listed' and disappeared from both the catalogue and the shop.
     let extraUpdate = '';
     let extraValues = [];
     const newStatus = req.body.status;
     if (newStatus === 'listed' && !before.shoe_code) {
-      const { generateUniqueShoeCode } = require('../services/shoeCodes');
-      const code = await generateUniqueShoeCode(req.body.brand || before.brand);
-      extraUpdate = ', shoe_code = $' + (updates.length + 2);
-      extraValues.push(code);
+      let code = null;
+      try {
+        const { generateUniqueShoeCode } = require('../services/shoeCodes');
+        code = await generateUniqueShoeCode(req.body.brand || before.brand);
+      } catch (e) {
+        // Inline fallback so the QR still works and listing never breaks
+        console.warn('shoeCodes service failed in PATCH /shoes/:id, using inline fallback:', e.message);
+        const bc = (req.body.brand || before.brand || 'KSM').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6) || 'KSM';
+        const rnd = Array.from({ length: 4 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 32)]).join('');
+        code = `KSM-${bc}-${rnd}`;
+      }
+      if (code) {
+        extraUpdate = ', shoe_code = $' + (updates.length + 2);
+        extraValues.push(code);
+      }
     }
     // Set listed_at timestamp when transitioning to listed
     if (newStatus === 'listed' && before.status !== 'listed') {
