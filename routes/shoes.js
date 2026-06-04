@@ -151,7 +151,7 @@ router.get('/', optionalAuth, async (req, res, next) => {
          SELECT g.*,
                 ROUND(AVG(r.stars), 1) AS avg_rating,
                 COUNT(r.id)            AS review_count,
-                (SELECT url FROM shoe_photos p WHERE p.shoe_id = g.representative_id ORDER BY p.sort_order LIMIT 1) AS primary_photo
+                (SELECT url FROM shoe_photos p WHERE p.shoe_id = g.representative_id ORDER BY p.is_cover DESC, p.sort_order LIMIT 1) AS primary_photo
          FROM grouped g
          LEFT JOIN reviews r ON r.shoe_id = g.representative_id
          GROUP BY g.group_brand_key, g.group_model_key, g.group_size_key, g.group_colour_key, g.group_wear_key,
@@ -183,7 +183,7 @@ router.get('/', optionalAuth, async (req, res, next) => {
                 s.rrp, s.rent_price, s.buy_price, s.listed_at AS first_listed_at,
                 1 AS stock_count, NULL::numeric AS avg_rating, 0 AS review_count,
                 NULL::text AS assessed_wear_grade,
-                (SELECT url FROM shoe_photos p WHERE p.shoe_id = s.id ORDER BY p.sort_order LIMIT 1) AS primary_photo
+                (SELECT url FROM shoe_photos p WHERE p.shoe_id = s.id ORDER BY p.is_cover DESC, p.sort_order LIMIT 1) AS primary_photo
          FROM shoes s ${whereClause}
          ORDER BY ${flatSort}
          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
@@ -299,7 +299,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
 
     // Fetch photos
     const photos = await db.query(
-      'SELECT id, url, caption, sort_order FROM shoe_photos WHERE shoe_id = $1 ORDER BY sort_order',
+      'SELECT id, url, caption, sort_order, is_cover FROM shoe_photos WHERE shoe_id = $1 ORDER BY is_cover DESC, sort_order',
       [req.params.id]
     );
 

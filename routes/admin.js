@@ -606,7 +606,9 @@ router.get('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
       `SELECT s.*,
               u.first_name, u.last_name, u.email AS owner_email,
               u.first_name || ' ' || u.last_name AS owner_display,
-              ls.reference AS submission_ref, ls.collection_postcode
+              ls.reference AS submission_ref, ls.collection_postcode,
+              (SELECT sp.url FROM shoe_photos sp WHERE sp.shoe_id = s.id
+                ORDER BY sp.is_cover DESC, sp.sort_order ASC, sp.uploaded_at ASC LIMIT 1) AS cover_url
        FROM shoes s
        JOIN users u ON u.id = s.owner_id
        LEFT JOIN submission_shoes ss ON ss.shoe_id = s.id
