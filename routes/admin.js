@@ -6,6 +6,28 @@ const emailService = require('../services/email');
 const { logActivity } = require('../services/activityLog');
 const router  = express.Router();
 
+// ── KSM shoe code ─────────────────────────────────────────────────────────────
+// Format: KSM-BRAND-{size}{GenderInitial}-{4 digits}   e.g. KSM-NIKE-9M-4821
+// Gender initial: Men's→M, Women's→W, Unisex→U, Kids→K. Size keeps half sizes (9.5).
+// Checks the DB for collisions and retries. Never throws — always returns a code.
+async function generateKsmCode(brand, size, gender) {
+  const bc = String(brand || 'KSM').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6) || 'KSM';
+  const g  = { "men's": 'M', mens: 'M', men: 'M', "women's": 'W', womens: 'W', women: 'W',
+               unisex: 'U', kids: 'K', kid: 'K', children: 'K' }[String(gender || '').toLowerCase()] || 'U';
+  const sz = String(size || '').replace(/[^0-9.]/g, '') || '0';
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const digits = String(Math.floor(1000 + Math.random() * 9000)); // always 4 digits
+    const code = `KSM-${bc}-${sz}${g}-${digits}`;
+    try {
+      const { rows } = await db.query('SELECT 1 FROM shoes WHERE shoe_code = $1 LIMIT 1', [code]);
+      if (!rows.length) return code;
+    } catch (e) {
+      return code; // if the uniqueness check itself fails, use the code anyway
+    }
+  }
+  return `KSM-${bc}-${sz}${g}-${String(Math.floor(1000 + Math.random() * 9000))}`;
+}
+
 // All admin routes require authentication + staff or admin role
 router.use(authenticate, requireRole('staff', 'admin'));
 
@@ -445,25 +467,17 @@ router.patch('/shoes/:id', requireRole('staff', 'admin'), async (req, res, next)
     const { rows: [before] } = await db.query(`SELECT * FROM shoes WHERE id = $1`, [req.params.id]);
     if (!before) return res.status(404).json({ error: 'Shoe not found' });
 
-    // Generate a KSM code on first listing if missing.
-    // Defensive: a failure here must NOT abort the listing. Previously an error
-    // in the shoeCodes service threw and 500'd the whole PATCH, so the shoe never
-    // flipped to 'listed' and disappeared from both the catalogue and the shop.
+    // Generate a KSM code on first listing if missing (new format includes size+gender).
+    // generateKsmCode never throws, so this can never abort the listing.
     let extraUpdate = '';
     let extraValues = [];
     const newStatus = req.body.status;
     if (newStatus === 'listed' && !before.shoe_code) {
-      let code = null;
-      try {
-        const { generateUniqueShoeCode } = require('../services/shoeCodes');
-        code = await generateUniqueShoeCode(req.body.brand || before.brand);
-      } catch (e) {
-        // Inline fallback so the QR still works and listing never breaks
-        console.warn('shoeCodes service failed in PATCH /shoes/:id, using inline fallback:', e.message);
-        const bc = (req.body.brand || before.brand || 'KSM').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6) || 'KSM';
-        const rnd = Array.from({ length: 4 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 32)]).join('');
-        code = `KSM-${bc}-${rnd}`;
-      }
+      const code = await generateKsmCode(
+        req.body.brand  || before.brand,
+        req.body.size   || before.size,
+        req.body.gender || before.gender
+      );
       if (code) {
         extraUpdate = ', shoe_code = $' + (updates.length + 2);
         extraValues.push(code);
@@ -561,7 +575,7 @@ router.get('/orders', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { rows } = await db.query(
       `SELECT o.*,
-              s.brand, s.model, s.emoji,
+              s.brand, s.model, s.emoji, s.size AS shoe_size, s.shoe_code,
               u.first_name || ' ' || u.last_name AS customer_name,
               u.email AS customer_email
        FROM orders o
@@ -795,15 +809,10 @@ router.post('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
     const initialStatus = status || 'awaiting_approval';
     const isListing = initialStatus === 'listed';
 
-    // Only generate a KSM code if creating as listed
+    // Only generate a KSM code if creating as listed (new format includes size+gender)
     let shoeCode = null;
     if (isListing) {
-      try {
-        const { generateUniqueShoeCode } = require('../services/shoeCodes');
-        shoeCode = await generateUniqueShoeCode(brand);
-      } catch (e) {
-        console.warn('Could not generate shoe code:', e.message);
-      }
+      shoeCode = await generateKsmCode(brand, size, gender);
     }
 
     // Probe which columns actually exist in the shoes table (defensive against partial migrations)
