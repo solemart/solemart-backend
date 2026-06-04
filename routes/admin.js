@@ -2093,31 +2093,20 @@ router.delete('/shoes/:shoeId/photos/:photoId', requireRole('staff', 'admin'), a
 // PATCH set a photo as the cover (display photo)
 router.patch('/shoes/:shoeId/photos/:photoId/cover', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
-    // Unset previous cover for this shoe, then set the new one — single transaction
-    const client = await db.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(
-        `UPDATE shoe_photos SET is_cover = FALSE WHERE shoe_id = $1`,
-        [req.params.shoeId]
-      );
-      const { rowCount } = await client.query(
-        `UPDATE shoe_photos SET is_cover = TRUE
-         WHERE id = $1 AND shoe_id = $2`,
-        [req.params.photoId, req.params.shoeId]
-      );
-      if (!rowCount) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ error: 'Photo not found' });
-      }
-      await client.query('COMMIT');
-      res.json({ ok: true });
-    } catch (e) {
-      await client.query('ROLLBACK');
-      throw e;
-    } finally {
-      client.release();
+    // Set the chosen photo as cover first (verifies it exists), then clear the rest.
+    // Uses plain db.query — no explicit transaction — so it works regardless of the db client shape.
+    const { rowCount } = await db.query(
+      `UPDATE shoe_photos SET is_cover = TRUE WHERE id = $1 AND shoe_id = $2`,
+      [req.params.photoId, req.params.shoeId]
+    );
+    if (!rowCount) {
+      return res.status(404).json({ error: 'Photo not found' });
     }
+    await db.query(
+      `UPDATE shoe_photos SET is_cover = FALSE WHERE shoe_id = $1 AND id <> $2`,
+      [req.params.shoeId, req.params.photoId]
+    );
+    res.json({ ok: true });
   } catch (err) {
     console.error('Set cover error:', err);
     res.status(500).json({ error: err.message || 'Could not set cover' });
