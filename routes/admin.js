@@ -101,7 +101,7 @@ router.get('/queue', async (req, res, next) => {
        LEFT JOIN submission_shoes ss ON ss.shoe_id = s.id
        LEFT JOIN listing_submissions ls ON ls.id = ss.submission_id
        WHERE ${where}
-       ORDER BY s.submitted_at ASC`,
+       ORDER BY s.created_at ASC`,
     );
 
     // Also include unprocessed donations in the unified queue

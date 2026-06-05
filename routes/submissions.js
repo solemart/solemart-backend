@@ -166,10 +166,14 @@ router.post('/', authenticate, [
 
     await client.query('COMMIT');
 
-    // Log activity
-    await logActivity(req.user.id, 'submission.created', 'submission', submission.id, {
-      reference, shoe_count: createdShoes.length,
-    });
+    // Log activity (non-fatal — a logging failure must never sink a committed submission)
+    try {
+      await logActivity(req.user.id, 'submission.created', 'submission', submission.id, {
+        reference, shoe_count: createdShoes.length,
+      });
+    } catch (logErr) {
+      console.warn('logActivity failed (non-fatal):', logErr.message);
+    }
 
     // Email confirmation with label (non-blocking)
     emailService.sendSubmissionConfirmation(req.user, submission, createdShoes, labelUrl).catch(console.error);
