@@ -131,23 +131,33 @@ router.post('/', authenticate, [
       );
     }
 
-    // Generate shipping label
-    const labelUrl = await labelService.generateListingLabel({
-      reference,
-      owner: req.user,
-      shoes: createdShoes,
-      collectionAddress: {
-        line1: collection_line1, line2: collection_line2,
-        city: collection_city, county: collection_county,
-        postcode: collection_postcode,
-      },
-    });
+    // Generate a shipping label ONLY for the prepaid-label option, and never let a
+    // label failure sink the submission (for "post yourself" the owner ships it themselves).
+    let labelUrl = null;
+    if (deliveryMethod === 'label') {
+      try {
+        labelUrl = await labelService.generateListingLabel({
+          reference,
+          owner: req.user,
+          shoes: createdShoes,
+          collectionAddress: {
+            line1: collection_line1, line2: collection_line2,
+            city: collection_city, county: collection_county,
+            postcode: collection_postcode,
+          },
+        });
+      } catch (e) {
+        console.error('Label generation failed (non-fatal):', e);
+      }
+    }
 
-    // Update submission with label URL
-    await client.query(
-      'UPDATE listing_submissions SET label_url = $1 WHERE id = $2',
-      [labelUrl, submission.id]
-    );
+    // Update submission with label URL (only if one was generated)
+    if (labelUrl) {
+      await client.query(
+        'UPDATE listing_submissions SET label_url = $1 WHERE id = $2',
+        [labelUrl, submission.id]
+      );
+    }
 
     await client.query('COMMIT');
 
@@ -165,7 +175,10 @@ router.post('/', authenticate, [
     });
   } catch (err) {
     await client.query('ROLLBACK');
-    next(err);
+    // TEMPORARY (debugging): surface the real error so we can see the cause without logs.
+    // Revert to `next(err)` once the underlying issue is fixed.
+    console.error('Submission error:', err);
+    res.status(500).json({ error: err.message || 'Submission failed' });
   } finally {
     client.release();
   }
