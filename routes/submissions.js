@@ -84,6 +84,11 @@ router.post('/', authenticate, [
     // Create each shoe and link to submission
     const createdShoes = [];
     for (const shoe of shoes) {
+      // Normalise the owner's condition to the coarse values the DB accepts (New / Pre-owned).
+      // The wizard offers granular grades (Brand New, Like New, Very Good, …); the precise wear
+      // grade is assigned by the team during authentication, so nothing is lost here.
+      const normalisedCondition =
+        (shoe.condition === 'New' || shoe.condition === 'Brand New') ? 'New' : 'Pre-owned';
       const { rows: shoeRows } = await client.query(
         `INSERT INTO shoes
            (owner_id, brand, model, size, colour, category, gender,
@@ -98,7 +103,7 @@ router.post('/', authenticate, [
           shoe.listing_type,
           shoe.rent_price ? parseFloat(shoe.rent_price) : null,
           shoe.buy_price  ? parseFloat(shoe.buy_price)  : null,
-          shoe.condition  || null,
+          normalisedCondition,
         ]
       );
       const createdShoe = shoeRows[0];
