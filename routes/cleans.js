@@ -58,6 +58,29 @@ router.get('/pricing', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── GET /api/cleans/verify?session_id=xxx  (public — for the success page) ─────
+// Reports whether a checkout session was paid and whether the booking has been
+// confirmed by the webhook yet. Defined before '/:id' so it isn't captured.
+router.get('/verify', async (req, res, next) => {
+  try {
+    const { session_id } = req.query;
+    if (!session_id) return res.status(400).json({ error: 'session_id required' });
+    const { stripe } = require('../services/stripe');
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    const paid = session.payment_status === 'paid';
+    let reference = null, ready = false;
+    const bookingId = session.metadata?.booking_id;
+    if (bookingId) {
+      const { rows } = await db.query(
+        `SELECT reference, payment_status FROM clean_bookings WHERE id = $1`,
+        [parseInt(bookingId)]
+      );
+      if (rows[0]) { reference = rows[0].reference; ready = rows[0].payment_status === 'paid'; }
+    }
+    res.json({ paid, ready, reference, status: session.payment_status });
+  } catch (err) { next(err); }
+});
+
 // ── POST /api/cleans  (anyone can book) ───────────────────────
 router.post('/', optionalAuth, [
   body('service_type').isIn(['express','deep','restoration','restore']).withMessage('Invalid service type'),
@@ -97,13 +120,17 @@ router.post('/', optionalAuth, [
       : `[Customer posting themselves]`;
     const combinedNotes = [deliveryTag, notes].filter(Boolean).join('\n');
 
+    // Create the booking as PENDING until Stripe confirms payment. No label or
+    // confirmation email yet — those happen in the webhook once payment lands,
+    // so an abandoned checkout never produces a label or a confirmed booking.
     const { rows } = await db.query(
       `INSERT INTO clean_bookings
          (reference, customer_id, contact_name, contact_email, contact_phone,
           shoe_description, pair_count, service_type, service_name,
           price_per_pair, total_price, preferred_date, notes,
-          return_line1, return_line2, return_city, return_county, return_postcode)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+          return_line1, return_line2, return_city, return_county, return_postcode,
+          payment_status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending_payment')
        RETURNING *`,
       [
         reference,
@@ -117,42 +144,63 @@ router.post('/', optionalAuth, [
         return_city || null, return_county || null, return_postcode,
       ]
     );
-
     const booking = rows[0];
 
-    // Generate label (non-fatal — a label failure must never sink a booking)
-    let labelUrl = null;
-    try {
-      labelUrl = await labelService.generateCleanLabel({
-        reference,
-        contact: { name: contact_name, email: contact_email },
-        returnAddress: {
-          line1: return_line1, line2: return_line2,
-          city: return_city, county: return_county, postcode: return_postcode,
+    // Build a Stripe Checkout session for the cleaning total (+ label fee if
+    // chosen). No Connect split — the studio keeps 100% of cleaning revenue.
+    const { stripe } = require('../services/stripe');
+    const appUrl = process.env.APP_URL || 'https://beautifullyordered.co.uk';
+
+    const lineItems = [{
+      price_data: {
+        currency: 'gbp',
+        product_data: {
+          name: `${serviceName} — Shoe Cleaning`,
+          description: `${pairs} pair${pairs > 1 ? 's' : ''}${estWeight != null ? ' · est. ' + estWeight.toFixed(1) + 'kg' : ''}`,
         },
-        service: serviceName,
-        pairCount: pairs,
-        total: `£${totalPrice.toFixed(2)}`,
+        unit_amount: Math.round(pricePerPair * 100),
+      },
+      quantity: pairs,
+    }];
+    if (labelFee > 0) {
+      lineItems.push({
+        price_data: {
+          currency: 'gbp',
+          product_data: {
+            name: 'Prepaid Shipping Label',
+            description: 'Royal Mail tracked — emailed to you',
+          },
+          unit_amount: Math.round(labelFee * 100),
+        },
+        quantity: 1,
+      });
+    }
+
+    const sessionMeta = { kind: 'clean', booking_id: String(booking.id), reference };
+
+    let session;
+    try {
+      session = await stripe.checkout.sessions.create({
+        mode: 'payment',
+        payment_method_types: ['card'],
+        customer_email: contact_email,
+        line_items: lineItems,
+        payment_intent_data: { metadata: sessionMeta },
+        success_url: `${appUrl}?clean=success&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${appUrl}?clean=cancel`,
+        expires_at: Math.floor(Date.now() / 1000) + 30 * 60, // 30-min window
+        metadata: sessionMeta,
       });
     } catch (e) {
-      console.error('Clean label generation failed (non-fatal):', e.message);
+      // Payment setup failed — remove the orphaned pending booking, then report.
+      await db.query(`DELETE FROM clean_bookings WHERE id = $1 AND payment_status = 'pending_payment'`, [booking.id]);
+      console.error('Clean checkout session creation failed:', e.message);
+      return res.status(502).json({ error: 'Could not start payment. Please try again.' });
     }
-    if (labelUrl) {
-      await db.query('UPDATE clean_bookings SET label_url = $1 WHERE id = $2', [labelUrl, booking.id]);
-    }
 
-    // Send confirmation email with label (non-blocking)
-    emailService.sendCleanBookingConfirmation({
-      name: contact_name, email: contact_email,
-    }, booking, labelUrl).catch(console.error);
+    await db.query(`UPDATE clean_bookings SET stripe_session_id = $1 WHERE id = $2`, [session.id, booking.id]);
 
-    try {
-      await logActivity(req.user?.id, 'clean.booked', 'clean_booking', booking.id, {
-        reference, service_type: svcType, pair_count: pairs,
-      });
-    } catch (e) { console.warn('logActivity failed (non-fatal):', e.message); }
-
-    res.status(201).json({ booking: { ...booking, label_url: labelUrl } });
+    res.status(201).json({ checkout_url: session.url, session_id: session.id, reference, booking_id: booking.id });
   } catch (err) {
     next(err);
   }
@@ -209,10 +257,9 @@ router.delete('/:id', authenticate, async (req, res, next) => {
   }
 });
 
-// ── One-time seed: ensure the cleaning-price settings exist ───────────────────
-// Runs on startup via the app's own DB connection (the one that actually targets
-// your live database), so there's no need to run SQL by hand. Idempotent — does
-// nothing if the rows already exist, and is non-fatal if anything goes wrong.
+// ── One-time seed: cleaning settings + clean_bookings payment columns ─────────
+// Runs on startup via the app's own DB connection (the one that targets your live
+// database), so there's no need to run SQL by hand. Idempotent and non-fatal.
 (async () => {
   try {
     await db.query(
@@ -223,9 +270,12 @@ router.delete('/:id', authenticate, async (req, res, next) => {
          ('clean_label_fee',         '5.95'::jsonb, 'Prepaid shipping label fee for clean bookings')
        ON CONFLICT (key) DO NOTHING`
     );
-    console.log('Cleaning-price settings ensured.');
+    // Payment tracking columns for the Stripe checkout flow.
+    await db.query(`ALTER TABLE clean_bookings ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'paid'`);
+    await db.query(`ALTER TABLE clean_bookings ADD COLUMN IF NOT EXISTS stripe_session_id TEXT`);
+    console.log('Cleaning settings + payment columns ensured.');
   } catch (e) {
-    console.warn('Clean settings seed skipped:', e.message);
+    console.warn('Clean settings/columns seed skipped:', e.message);
   }
 })();
 

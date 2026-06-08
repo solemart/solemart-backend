@@ -148,6 +148,7 @@ router.get('/queue', async (req, res, next) => {
            FROM clean_bookings cb
            LEFT JOIN users u ON u.id = cb.customer_id
            WHERE cb.status NOT IN ('returned','cancelled')
+             AND cb.payment_status = 'paid'
            ORDER BY cb.booked_at ASC`
         );
         cleanBookings = rows.map(cb => ({

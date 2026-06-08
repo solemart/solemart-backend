@@ -299,6 +299,53 @@ router.post('/stripe', async (req, res) => {
             });
           }
         }
+
+        // CLEAN BOOKING payments — activate the pending booking now it's paid
+        if (m.kind === 'clean' && session.payment_status === 'paid') {
+          const bookingId = parseInt(m.booking_id);
+          const { rows } = await db.query(`SELECT * FROM clean_bookings WHERE id = $1`, [bookingId]);
+          const booking = rows[0];
+          // Idempotency — only act on a pending booking we haven't confirmed yet
+          if (booking && booking.payment_status !== 'paid') {
+            await db.query(
+              `UPDATE clean_bookings SET payment_status = 'paid', stripe_session_id = $1 WHERE id = $2`,
+              [session.id, bookingId]
+            );
+
+            // Generate the prepaid label now that payment is real (non-fatal)
+            let labelUrl = null;
+            try {
+              const labelService = require('../services/label');
+              const labelResult = await labelService.generateCleanLabel({
+                reference: booking.reference,
+                contact: { name: booking.contact_name, email: booking.contact_email },
+                returnAddress: {
+                  line1: booking.return_line1, line2: booking.return_line2,
+                  city: booking.return_city, county: booking.return_county,
+                  postcode: booking.return_postcode,
+                },
+                service: booking.service_name,
+                pairCount: booking.pair_count,
+                total: `£${parseFloat(booking.total_price).toFixed(2)}`,
+              });
+              labelUrl = labelResult ? String(labelResult) : null;
+              if (labelUrl) {
+                await db.query('UPDATE clean_bookings SET label_url = $1 WHERE id = $2', [labelUrl, bookingId]);
+              }
+            } catch (e) { console.warn('Clean label gen failed:', e.message); }
+
+            // Confirmation email with the label (non-fatal)
+            try {
+              await emailService.sendCleanBookingConfirmation(
+                { name: booking.contact_name, email: booking.contact_email }, booking, labelUrl
+              );
+            } catch (e) { console.warn('Clean email failed:', e.message); }
+
+            await logActivity(null, 'clean.paid', 'clean_booking', bookingId, {
+              reference: booking.reference,
+            });
+          }
+        }
         break;
       }
 
@@ -316,6 +363,14 @@ router.post('/stripe', async (req, res) => {
             );
           }
           await logActivity(null, 'checkout.expired', 'user', m.user_id, { items: payload.length });
+        }
+        if (m.kind === 'clean' && m.booking_id) {
+          // Remove the abandoned pending booking (no label/email was ever sent)
+          await db.query(
+            `DELETE FROM clean_bookings WHERE id = $1 AND payment_status = 'pending_payment'`,
+            [parseInt(m.booking_id)]
+          );
+          await logActivity(null, 'clean.checkout_expired', 'clean_booking', parseInt(m.booking_id), {});
         }
         break;
       }
