@@ -102,14 +102,14 @@ router.get('/', optionalAuth, async (req, res, next) => {
     }
 
     const sortMap = {
-      newest:       'MAX(s.listed_at) DESC',
-      oldest:       'MIN(s.listed_at) ASC',
-      'price-asc':  'MIN(COALESCE(s.rent_price, s.buy_price)) ASC',
-      'price-desc': 'MIN(COALESCE(s.rent_price, s.buy_price)) DESC',
-      'rrp-asc':    'MIN(s.rrp) ASC',
-      'rrp-desc':   'MAX(s.rrp) DESC',
-      brand:        'MIN(s.brand) ASC, MIN(s.model) ASC',
-      stock:        'COUNT(*) DESC',
+      newest:       'g.last_listed_at DESC NULLS LAST',
+      oldest:       'g.first_listed_at ASC',
+      'price-asc':  'COALESCE(g.rent_price, g.buy_price) ASC',
+      'price-desc': 'COALESCE(g.rent_price, g.buy_price) DESC',
+      'rrp-asc':    'g.rrp ASC NULLS LAST',
+      'rrp-desc':   'g.rrp DESC NULLS LAST',
+      brand:        'g.brand ASC, g.model ASC',
+      stock:        'g.stock_count DESC',
     };
     const orderBy = sortMap[sort] || sortMap.newest;
     const whereClause = `WHERE ${conditions.join(' AND ')}`;
@@ -123,9 +123,7 @@ router.get('/', optionalAuth, async (req, res, next) => {
            SELECT
              LOWER(s.brand)                       AS group_brand_key,
              LOWER(s.model)                       AS group_model_key,
-             LOWER(COALESCE(s.size, ''))          AS group_size_key,
              LOWER(COALESCE(s.colour, ''))        AS group_colour_key,
-             LOWER(COALESCE(s.assessed_wear_grade, '')) AS group_wear_key,
              MIN(s.brand)                          AS brand,
              MIN(s.model)                          AS model,
              MIN(s.size)                           AS size,
@@ -140,24 +138,28 @@ router.get('/', optionalAuth, async (req, res, next) => {
              MIN(s.rrp)                            AS rrp,
              MIN(s.rent_price)                     AS rent_price,
              MIN(s.buy_price)                      AS buy_price,
+             MIN(COALESCE(s.rental_count, 0))      AS rental_min,
+             MAX(COALESCE(s.rental_count, 0))      AS rental_max,
              COUNT(*)                              AS stock_count,
+             array_remove(array_agg(DISTINCT s.size), NULL) AS sizes_available,
              MIN(s.listed_at)                      AS first_listed_at,
              MAX(s.listed_at)                      AS last_listed_at,
              (array_agg(s.id ORDER BY s.listed_at ASC NULLS LAST))[1] AS representative_id
            FROM shoes s
            ${whereClause}
-           GROUP BY group_brand_key, group_model_key, group_size_key, group_colour_key, group_wear_key
+           GROUP BY group_brand_key, group_model_key, group_colour_key
          )
          SELECT g.*,
                 ROUND(AVG(r.stars), 1) AS avg_rating,
                 COUNT(r.id)            AS review_count,
-                (SELECT url FROM shoe_photos p WHERE p.shoe_id = g.representative_id ORDER BY p.is_cover DESC, p.sort_order LIMIT 1) AS primary_photo
+                (SELECT url FROM shoe_photos p WHERE p.shoe_id = g.representative_id ORDER BY p.sort_order LIMIT 1) AS primary_photo
          FROM grouped g
          LEFT JOIN reviews r ON r.shoe_id = g.representative_id
-         GROUP BY g.group_brand_key, g.group_model_key, g.group_size_key, g.group_colour_key, g.group_wear_key,
+         GROUP BY g.group_brand_key, g.group_model_key, g.group_colour_key,
                   g.brand, g.model, g.size, g.colour, g.category, g.gender, g.condition, g.assessed_wear_grade,
                   g.emoji, g.description, g.listing_type, g.rrp, g.rent_price, g.buy_price,
-                  g.stock_count, g.first_listed_at, g.last_listed_at, g.representative_id
+                  g.rental_min, g.rental_max, g.stock_count, g.sizes_available,
+                  g.first_listed_at, g.last_listed_at, g.representative_id
          ORDER BY ${orderBy}
          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, parseInt(limit), offset]
@@ -182,8 +184,8 @@ router.get('/', optionalAuth, async (req, res, next) => {
                 s.gender, s.condition, s.emoji, s.description, s.listing_type,
                 s.rrp, s.rent_price, s.buy_price, s.listed_at AS first_listed_at,
                 1 AS stock_count, NULL::numeric AS avg_rating, 0 AS review_count,
-                NULL::text AS assessed_wear_grade,
-                (SELECT url FROM shoe_photos p WHERE p.shoe_id = s.id ORDER BY p.is_cover DESC, p.sort_order LIMIT 1) AS primary_photo
+                NULL::text AS assessed_wear_grade, s.rental_count,
+                (SELECT url FROM shoe_photos p WHERE p.shoe_id = s.id ORDER BY p.sort_order LIMIT 1) AS primary_photo
          FROM shoes s ${whereClause}
          ORDER BY ${flatSort}
          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
@@ -198,11 +200,15 @@ router.get('/', optionalAuth, async (req, res, next) => {
       brand:               r.brand,
       model:               r.model,
       size:                r.size,
+      sizes_available:     (r.sizes_available && r.sizes_available.length) ? r.sizes_available : (r.size ? [r.size] : []),
       colour:              r.colour,
       category:            r.category,
       gender:              r.gender,
       condition:           r.condition,
       assessed_wear_grade: r.assessed_wear_grade,
+      rental_count:        parseInt(r.rental_min ?? r.rental_count ?? 0),
+      rental_min:          parseInt(r.rental_min ?? r.rental_count ?? 0),
+      rental_max:          parseInt(r.rental_max ?? r.rental_count ?? 0),
       emoji:               r.emoji,
       description:         r.description,
       listing_type:        r.listing_type,
@@ -222,8 +228,7 @@ router.get('/', optionalAuth, async (req, res, next) => {
       const countRes = await db.query(
         `SELECT COUNT(*) FROM (
            SELECT 1 FROM shoes s ${whereClause}
-           GROUP BY LOWER(s.brand), LOWER(s.model), LOWER(COALESCE(s.size,'')),
-                    LOWER(COALESCE(s.colour,'')), LOWER(COALESCE(s.assessed_wear_grade,''))
+           GROUP BY LOWER(s.brand), LOWER(s.model), LOWER(COALESCE(s.colour,''))
          ) g`,
         params
       );
@@ -273,20 +278,45 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     if (!rows.length) return res.status(404).json({ error: 'Shoe not found' });
     const shoe = rows[0];
 
-    // Compute stock count for this variant group (defensive — column may not exist)
+    // All available sizes for this model → power a size selector on the detail page.
+    // One entry per size (the freshest available pair), plus the overall wear range.
+    let variants = [];
+    let rentalMin = shoe.rental_count || 0;
+    let rentalMax = shoe.rental_count || 0;
     try {
-      const { rows: stockRows } = await db.query(
-        `SELECT COUNT(*)::int AS stock_count FROM shoes
+      const { rows: vrows } = await db.query(
+        `SELECT MIN(size) AS size,
+                (array_agg(id ORDER BY COALESCE(rental_count,0) ASC, listed_at ASC NULLS LAST))[1] AS id,
+                MIN(COALESCE(rental_count,0)) AS rental_count,
+                MIN(rent_price) AS rent_price,
+                MIN(buy_price)  AS buy_price,
+                MIN(condition)  AS condition,
+                COUNT(*)::int   AS stock
+         FROM shoes
          WHERE status = 'listed'
            AND LOWER(brand) = LOWER($1)
            AND LOWER(model) = LOWER($2)
-           AND LOWER(COALESCE(size,'')) = LOWER(COALESCE($3,''))
-           AND LOWER(COALESCE(colour,'')) = LOWER(COALESCE($4,''))
-           AND LOWER(COALESCE(assessed_wear_grade,'')) = LOWER(COALESCE($5,''))`,
-        [shoe.brand, shoe.model, shoe.size, shoe.colour, shoe.assessed_wear_grade]
+           AND LOWER(COALESCE(colour,'')) = LOWER(COALESCE($3,''))
+         GROUP BY LOWER(COALESCE(size,''))
+         ORDER BY NULLIF(regexp_replace(COALESCE(MIN(size),''), '[^0-9.]', '', 'g'), '')::numeric NULLS LAST, MIN(size)`,
+        [shoe.brand, shoe.model, shoe.colour]
       );
-      shoe.stock_count = stockRows[0].stock_count;
+      variants = vrows.map(v => ({
+        id: v.id,
+        size: v.size,
+        rental_count: parseInt(v.rental_count || 0),
+        rent_price: v.rent_price,
+        buy_price: v.buy_price,
+        condition: v.condition,
+        stock: v.stock,
+      }));
+      if (variants.length) {
+        rentalMin = variants.reduce((m, v) => Math.min(m, v.rental_count), variants[0].rental_count);
+        rentalMax = variants.reduce((m, v) => Math.max(m, v.rental_count), 0);
+        shoe.stock_count = variants.reduce((a, v) => a + (v.stock || 0), 0) || 1;
+      }
     } catch (e) {
+      variants = [{ id: shoe.id, size: shoe.size, rental_count: shoe.rental_count || 0, rent_price: shoe.rent_price, buy_price: shoe.buy_price, condition: shoe.condition, stock: 1 }];
       shoe.stock_count = 1;
     }
     rows[0] = shoe;
@@ -299,7 +329,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
 
     // Fetch photos
     const photos = await db.query(
-      'SELECT id, url, caption, sort_order, is_cover FROM shoe_photos WHERE shoe_id = $1 ORDER BY is_cover DESC, sort_order',
+      'SELECT id, url, caption, sort_order FROM shoe_photos WHERE shoe_id = $1 ORDER BY sort_order',
       [req.params.id]
     );
 
@@ -315,7 +345,7 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
       [req.params.id]
     );
 
-    res.json({ ...rows[0], photos: photos.rows, reviews: reviews.rows });
+    res.json({ ...rows[0], photos: photos.rows, reviews: reviews.rows, variants, rental_min: rentalMin, rental_max: rentalMax });
   } catch (err) {
     next(err);
   }
