@@ -286,19 +286,19 @@ router.get('/:id', optionalAuth, async (req, res, next) => {
     try {
       const { rows: vrows } = await db.query(
         `SELECT MIN(size) AS size,
-                (array_agg(id ORDER BY COALESCE(rental_count,0) ASC, listed_at ASC NULLS LAST))[1] AS id,
-                MIN(COALESCE(rental_count,0)) AS rental_count,
+                (array_agg(id ORDER BY listed_at ASC NULLS LAST))[1] AS id,
+                COALESCE(rental_count,0) AS rental_count,
                 MIN(rent_price) AS rent_price,
                 MIN(buy_price)  AS buy_price,
-                MIN(condition)  AS condition,
+                condition,
                 COUNT(*)::int   AS stock
          FROM shoes
          WHERE status = 'listed'
            AND LOWER(brand) = LOWER($1)
            AND LOWER(model) = LOWER($2)
            AND LOWER(COALESCE(colour,'')) = LOWER(COALESCE($3,''))
-         GROUP BY LOWER(COALESCE(size,''))
-         ORDER BY NULLIF(regexp_replace(COALESCE(MIN(size),''), '[^0-9.]', '', 'g'), '')::numeric NULLS LAST, MIN(size)`,
+         GROUP BY LOWER(COALESCE(size,'')), COALESCE(rental_count,0), condition
+         ORDER BY NULLIF(regexp_replace(COALESCE(MIN(size),''), '[^0-9.]', '', 'g'), '')::numeric NULLS LAST, MIN(size), COALESCE(rental_count,0)`,
         [shoe.brand, shoe.model, shoe.colour]
       );
       variants = vrows.map(v => ({
