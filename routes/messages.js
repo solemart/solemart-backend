@@ -99,6 +99,26 @@ router.get('/:shoeId', authenticate, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── GET /api/messages/:shoeId/shoe — full listing details for this thread ────
+// Returns the shoe regardless of status (pending, sold, rented, …) so the
+// customer can always see exactly which pair the conversation is about.
+// Scoped to the owner of the shoe (or staff) via the same access check.
+router.get('/:shoeId/shoe', authenticate, async (req, res, next) => {
+  try {
+    const acc = await accessCheck(req.params.shoeId, req.user);
+    if (!acc.ok) return res.status(acc.code).json({ error: acc.code === 404 ? 'Not found' : 'Not authorised' });
+    const { rows: [shoe] } = await db.query(
+      `SELECT id, brand, model, colour, size, condition, assessed_wear_grade,
+              rental_count, rent_price, buy_price, rrp, status, listing_type,
+              category, gender, description, emoji, photos, listed_at, created_at
+         FROM shoes WHERE id::text = $1`,
+      [String(req.params.shoeId)]
+    );
+    if (!shoe) return res.status(404).json({ error: 'Not found' });
+    res.json(shoe);
+  } catch (err) { next(err); }
+});
+
 // ── POST /api/messages/:shoeId — send a message into the thread ──────────────
 router.post('/:shoeId', authenticate, async (req, res, next) => {
   try {
