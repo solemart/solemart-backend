@@ -6,12 +6,62 @@ const emailService = require('../services/email');
 const { logActivity } = require('../services/activityLog');
 const router  = express.Router();
 
-// Ensure the staff_roles column exists (idempotent self-seed on startup).
-// Roles: 'fulfilment', 'authentication', 'inventory', 'customer_service'.
+// Idempotent self-seed on startup: staff roles column, role definitions, HR profiles.
 (async () => {
   try {
     await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS staff_roles TEXT[] NOT NULL DEFAULT '{}'`);
-  } catch (e) { console.error('[admin] staff_roles seed failed:', e.message); }
+
+    // Admin-definable staff roles. pages[] = admin tab keys the role unlocks.
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS staff_role_defs (
+        key        TEXT PRIMARY KEY,
+        label      TEXT NOT NULL,
+        pages      TEXT[] NOT NULL DEFAULT '{}',
+        is_system  BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    const seeded = await db.query(`SELECT COUNT(*)::int AS n FROM staff_role_defs`);
+    if (seeded.rows[0].n === 0) {
+      const defaults = [
+        ['inventory',        'Inventory',        ['overview','submissions','shoes']],
+        ['authentication',   'Authentication',   ['overview','submissions','verifications']],
+        ['fulfilment',       'Fulfilment',       ['overview','orders']],
+        ['customer_service', 'Customer Service', ['overview','messages','orders']],
+      ];
+      for (const [key, label, pages] of defaults) {
+        await db.query(
+          `INSERT INTO staff_role_defs (key, label, pages, is_system) VALUES ($1,$2,$3,true) ON CONFLICT (key) DO NOTHING`,
+          [key, label, pages]
+        );
+      }
+    }
+
+    // Employment / HR record for staff members (deleted automatically with the user)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS staff_profiles (
+        user_id             UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        job_title           TEXT,
+        employment_type     TEXT,
+        start_date          DATE,
+        date_of_birth       DATE,
+        ni_number           TEXT,
+        rtw_status          TEXT,
+        rtw_reference       TEXT,
+        rtw_expiry          DATE,
+        emergency_name      TEXT,
+        emergency_relation  TEXT,
+        emergency_phone     TEXT,
+        bank_sort_code      TEXT,
+        bank_account_number TEXT,
+        pay_rate            TEXT,
+        notes               TEXT,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    console.log('[admin] staff tables ready');
+  } catch (e) { console.error('[admin] staff seed failed:', e.message); }
 })();
 
 // All admin routes require authentication + staff or admin role
@@ -327,11 +377,14 @@ router.get('/users', requireRole('admin'), async (req, res, next) => {
 });
 
 // ── PATCH /api/admin/users/:id/roles — set a staff member's job roles ──
-const STAFF_ROLES = ['fulfilment', 'authentication', 'inventory', 'customer_service'];
 router.patch('/users/:id/roles', requireRole('admin'), async (req, res, next) => {
   try {
-    let roles = Array.isArray(req.body.roles) ? req.body.roles : [];
-    roles = [...new Set(roles.filter(r => STAFF_ROLES.includes(r)))];
+    let roles = Array.isArray(req.body.roles) ? [...new Set(req.body.roles)] : [];
+    if (roles.length) {
+      const { rows: valid } = await db.query(`SELECT key FROM staff_role_defs WHERE key = ANY($1)`, [roles]);
+      const keys = valid.map(r => r.key);
+      roles = roles.filter(r => keys.includes(r));
+    }
     const { rows } = await db.query(
       `UPDATE users SET staff_roles = $1, updated_at = NOW()
        WHERE id = $2
@@ -344,15 +397,189 @@ router.patch('/users/:id/roles', requireRole('admin'), async (req, res, next) =>
   } catch (err) { next(err); }
 });
 
-// ── GET /api/admin/my-roles — the signed-in staff member's own job roles ──
+// ── GET /api/admin/my-roles — signed-in staff member's roles + resolved pages ──
 router.get('/my-roles', async (req, res, next) => {
   try {
     const { rows } = await db.query(
       `SELECT role, COALESCE(staff_roles, '{}') AS staff_roles FROM users WHERE id = $1`,
       [req.user.id]
     );
-    res.json(rows[0] || { role: req.user.role, staff_roles: [] });
+    const me = rows[0] || { role: req.user.role, staff_roles: [] };
+    let pages = ['overview'];
+    try {
+      if (me.staff_roles && me.staff_roles.length) {
+        const { rows: defs } = await db.query(`SELECT pages FROM staff_role_defs WHERE key = ANY($1)`, [me.staff_roles]);
+        defs.forEach(d => (d.pages || []).forEach(p => { if (pages.indexOf(p) < 0) pages.push(p); }));
+      }
+    } catch (e) { /* table may not exist yet */ }
+    res.json({ role: me.role, staff_roles: me.staff_roles, pages });
   } catch (err) { next(err); }
+});
+
+// ── Staff role definitions (admin-managed) ──────────────────────────────
+const RESERVED_PAGE_KEYS = ['overview','revenue','submissions','shoes','orders','messages','users','verifications','settings','reports','activity'];
+
+router.get('/roles', requireRole('admin'), async (req, res, next) => {
+  try {
+    const { rows } = await db.query(`SELECT key, label, pages, is_system FROM staff_role_defs ORDER BY is_system DESC, label ASC`);
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
+router.post('/roles', requireRole('admin'), async (req, res, next) => {
+  try {
+    const label = (req.body.label || '').trim();
+    if (!label) return res.status(400).json({ error: 'Role name required' });
+    let key = (req.body.key || label).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    if (!key) return res.status(400).json({ error: 'Invalid role name' });
+    let pages = Array.isArray(req.body.pages) ? req.body.pages.filter(p => RESERVED_PAGE_KEYS.includes(p)) : [];
+    if (pages.indexOf('overview') < 0) pages.unshift('overview');
+    pages = [...new Set(pages)];
+    const dup = await db.query(`SELECT 1 FROM staff_role_defs WHERE key = $1`, [key]);
+    if (dup.rows.length) return res.status(409).json({ error: 'A role with that name already exists' });
+    const { rows } = await db.query(
+      `INSERT INTO staff_role_defs (key, label, pages, is_system) VALUES ($1,$2,$3,false) RETURNING key, label, pages, is_system`,
+      [key, label, pages]
+    );
+    await logActivity(req.user.id, 'role.created', 'role', key);
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
+router.patch('/roles/:key', requireRole('admin'), async (req, res, next) => {
+  try {
+    const updates = [], values = [];
+    if (req.body.label !== undefined) { values.push(String(req.body.label).trim()); updates.push(`label = $${values.length}`); }
+    if (Array.isArray(req.body.pages)) {
+      let pages = req.body.pages.filter(p => RESERVED_PAGE_KEYS.includes(p));
+      if (pages.indexOf('overview') < 0) pages.unshift('overview');
+      pages = [...new Set(pages)];
+      values.push(pages); updates.push(`pages = $${values.length}`);
+    }
+    if (!updates.length) return res.status(400).json({ error: 'Nothing to update' });
+    values.push(req.params.key);
+    const { rows } = await db.query(
+      `UPDATE staff_role_defs SET ${updates.join(', ')} WHERE key = $${values.length} RETURNING key, label, pages, is_system`,
+      values
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Role not found' });
+    await logActivity(req.user.id, 'role.updated', 'role', req.params.key);
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
+router.delete('/roles/:key', requireRole('admin'), async (req, res, next) => {
+  try {
+    const { rows } = await db.query(`SELECT is_system FROM staff_role_defs WHERE key = $1`, [req.params.key]);
+    if (!rows.length) return res.status(404).json({ error: 'Role not found' });
+    if (rows[0].is_system) return res.status(400).json({ error: 'Default roles cannot be deleted' });
+    await db.query(`DELETE FROM staff_role_defs WHERE key = $1`, [req.params.key]);
+    await db.query(`UPDATE users SET staff_roles = array_remove(staff_roles, $1) WHERE $1 = ANY(staff_roles)`, [req.params.key]);
+    await logActivity(req.user.id, 'role.deleted', 'role', req.params.key);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// ── POST /api/admin/staff — hire a new staff member (creates account + HR record) ──
+router.post('/staff', requireRole('admin'), [
+  body('first_name').trim().notEmpty().withMessage('First name required'),
+  body('last_name').trim().notEmpty().withMessage('Last name required'),
+  body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
+], async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(422).json({ errors: errors.array() });
+    const b = req.body;
+    const dup = await db.query(`SELECT 1 FROM users WHERE email = $1`, [b.email]);
+    if (dup.rows.length) return res.status(409).json({ error: 'A user with that email already exists' });
+
+    const bcrypt = require('bcryptjs');
+    const tempPassword = 'Ks-' + Math.random().toString(36).slice(2, 8) + Math.random().toString(36).slice(2, 5).toUpperCase();
+    const password_hash = await bcrypt.hash(tempPassword, parseInt(process.env.BCRYPT_ROUNDS) || 12);
+    const role = (b.role === 'admin') ? 'admin' : 'staff';
+
+    let roles = Array.isArray(b.staff_roles) ? [...new Set(b.staff_roles)] : [];
+    if (roles.length) {
+      const { rows: valid } = await db.query(`SELECT key FROM staff_role_defs WHERE key = ANY($1)`, [roles]);
+      const keys = valid.map(v => v.key);
+      roles = roles.filter(r => keys.includes(r));
+    }
+
+    const { rows: urows } = await db.query(
+      `INSERT INTO users (first_name, last_name, email, password_hash, role, phone,
+                          addr_line1, addr_line2, addr_city, addr_county, addr_postcode,
+                          email_verified, staff_roles)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true,$12)
+       RETURNING id, first_name, last_name, email, role`,
+      [b.first_name, b.last_name, b.email, password_hash, role, b.phone || null,
+       b.addr_line1 || null, b.addr_line2 || null, b.addr_city || null, b.addr_county || null, b.addr_postcode || null,
+       roles]
+    );
+    const user = urows[0];
+
+    await db.query(
+      `INSERT INTO staff_profiles (user_id, job_title, employment_type, start_date, date_of_birth,
+        ni_number, rtw_status, rtw_reference, rtw_expiry, emergency_name, emergency_relation, emergency_phone,
+        bank_sort_code, bank_account_number, pay_rate, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+      [user.id, b.job_title||null, b.employment_type||null, b.start_date||null, b.date_of_birth||null,
+       b.ni_number||null, b.rtw_status||null, b.rtw_reference||null, b.rtw_expiry||null,
+       b.emergency_name||null, b.emergency_relation||null, b.emergency_phone||null,
+       b.bank_sort_code||null, b.bank_account_number||null, b.pay_rate||null, b.notes||null]
+    );
+
+    await logActivity(req.user.id, 'staff.created', 'user', user.id);
+    res.json({ user, temp_password: tempPassword });
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/admin/staff/:id — full staff record (user + HR profile) ──
+router.get('/staff/:id', requireRole('admin'), async (req, res, next) => {
+  try {
+    const { rows: u } = await db.query(
+      `SELECT id, first_name, last_name, email, phone, role, COALESCE(staff_roles,'{}') AS staff_roles,
+              addr_line1, addr_line2, addr_city, addr_county, addr_postcode, created_at
+       FROM users WHERE id = $1`, [req.params.id]
+    );
+    if (!u.length) return res.status(404).json({ error: 'Not found' });
+    const { rows: p } = await db.query(`SELECT * FROM staff_profiles WHERE user_id = $1`, [req.params.id]);
+    res.json({ user: u[0], profile: p[0] || null });
+  } catch (err) { next(err); }
+});
+
+// ── PATCH /api/admin/staff/:id/profile — update employment details ──
+router.patch('/staff/:id/profile', requireRole('admin'), async (req, res, next) => {
+  try {
+    const fields = ['job_title','employment_type','start_date','date_of_birth','ni_number','rtw_status','rtw_reference','rtw_expiry','emergency_name','emergency_relation','emergency_phone','bank_sort_code','bank_account_number','pay_rate','notes'];
+    const cols = [], vals = [];
+    for (const f of fields) if (req.body[f] !== undefined) { vals.push(req.body[f] === '' ? null : req.body[f]); cols.push(f); }
+    const insertCols = ['user_id', ...cols];
+    const insertVals = [req.params.id, ...vals];
+    const ph = insertVals.map((_, i) => '$' + (i + 1)).join(',');
+    const updateSet = cols.map((c, i) => `${c} = $${i + 2}`).join(', ');
+    await db.query(
+      `INSERT INTO staff_profiles (${insertCols.join(',')}) VALUES (${ph})
+       ON CONFLICT (user_id) DO UPDATE SET ${updateSet ? updateSet + ', ' : ''}updated_at = now()`,
+      insertVals
+    );
+    await logActivity(req.user.id, 'staff.profile_updated', 'user', req.params.id);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// ── DELETE /api/admin/users/:id — permanently remove a user ──
+router.delete('/users/:id', requireRole('admin'), async (req, res, next) => {
+  try {
+    if (req.params.id === req.user.id) return res.status(400).json({ error: 'You cannot delete your own account' });
+    const { rows } = await db.query(`SELECT id, role FROM users WHERE id = $1`, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    await db.query(`DELETE FROM users WHERE id = $1`, [req.params.id]);
+    await logActivity(req.user.id, 'user.deleted', 'user', req.params.id);
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.code === '23503') return res.status(409).json({ error: 'This user has linked records (listings, orders, etc.) and can\'t be permanently deleted. Reassign or remove those first.' });
+    next(err);
+  }
 });
 
 // ── PATCH /api/admin/users/:id/password  (admin resets a user's password) ──
