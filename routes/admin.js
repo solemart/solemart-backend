@@ -6,27 +6,13 @@ const emailService = require('../services/email');
 const { logActivity } = require('../services/activityLog');
 const router  = express.Router();
 
-// ── KSM shoe code ─────────────────────────────────────────────────────────────
-// Format: KSM-BRAND-{size}{GenderInitial}-{4 digits}   e.g. KSM-NIKE-9M-4821
-// Gender initial: Men's→M, Women's→W, Unisex→U, Kids→K. Size keeps half sizes (9.5).
-// Checks the DB for collisions and retries. Never throws — always returns a code.
-async function generateKsmCode(brand, size, gender) {
-  const bc = String(brand || 'KSM').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6) || 'KSM';
-  const g  = { "men's": 'M', mens: 'M', men: 'M', "women's": 'W', womens: 'W', women: 'W',
-               unisex: 'U', kids: 'K', kid: 'K', children: 'K' }[String(gender || '').toLowerCase()] || 'U';
-  const sz = String(size || '').replace(/[^0-9.]/g, '') || '0';
-  for (let attempt = 0; attempt < 12; attempt++) {
-    const digits = String(Math.floor(1000 + Math.random() * 9000)); // always 4 digits
-    const code = `KSM-${bc}-${sz}${g}-${digits}`;
-    try {
-      const { rows } = await db.query('SELECT 1 FROM shoes WHERE shoe_code = $1 LIMIT 1', [code]);
-      if (!rows.length) return code;
-    } catch (e) {
-      return code; // if the uniqueness check itself fails, use the code anyway
-    }
-  }
-  return `KSM-${bc}-${sz}${g}-${String(Math.floor(1000 + Math.random() * 9000))}`;
-}
+// Ensure the staff_roles column exists (idempotent self-seed on startup).
+// Roles: 'fulfilment', 'authentication', 'inventory', 'customer_service'.
+(async () => {
+  try {
+    await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS staff_roles TEXT[] NOT NULL DEFAULT '{}'`);
+  } catch (e) { console.error('[admin] staff_roles seed failed:', e.message); }
+})();
 
 // All admin routes require authentication + staff or admin role
 router.use(authenticate, requireRole('staff', 'admin'));
@@ -101,7 +87,7 @@ router.get('/queue', async (req, res, next) => {
        LEFT JOIN submission_shoes ss ON ss.shoe_id = s.id
        LEFT JOIN listing_submissions ls ON ls.id = ss.submission_id
        WHERE ${where}
-       ORDER BY s.created_at ASC`,
+       ORDER BY s.submitted_at ASC`,
     );
 
     // Also include unprocessed donations in the unified queue
@@ -148,7 +134,6 @@ router.get('/queue', async (req, res, next) => {
            FROM clean_bookings cb
            LEFT JOIN users u ON u.id = cb.customer_id
            WHERE cb.status NOT IN ('returned','cancelled')
-             AND cb.payment_status = 'paid'
            ORDER BY cb.booked_at ASC`
         );
         cleanBookings = rows.map(cb => ({
@@ -333,10 +318,40 @@ router.get('/users', requireRole('admin'), async (req, res, next) => {
     const { rows } = await db.query(
       `SELECT id, first_name, last_name, email, role, phone,
               addr_line1, addr_line2, addr_city, addr_county, addr_postcode,
-              shoe_size, email_verified, created_at
+              shoe_size, email_verified, created_at,
+              COALESCE(staff_roles, '{}') AS staff_roles
        FROM users ORDER BY created_at DESC LIMIT 500`
     );
     res.json(rows);
+  } catch (err) { next(err); }
+});
+
+// ── PATCH /api/admin/users/:id/roles — set a staff member's job roles ──
+const STAFF_ROLES = ['fulfilment', 'authentication', 'inventory', 'customer_service'];
+router.patch('/users/:id/roles', requireRole('admin'), async (req, res, next) => {
+  try {
+    let roles = Array.isArray(req.body.roles) ? req.body.roles : [];
+    roles = [...new Set(roles.filter(r => STAFF_ROLES.includes(r)))];
+    const { rows } = await db.query(
+      `UPDATE users SET staff_roles = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, first_name, last_name, email, role, COALESCE(staff_roles, '{}') AS staff_roles`,
+      [roles, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    await logActivity(req.user.id, 'user.roles_updated', 'user', req.params.id);
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/admin/my-roles — the signed-in staff member's own job roles ──
+router.get('/my-roles', async (req, res, next) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT role, COALESCE(staff_roles, '{}') AS staff_roles FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+    res.json(rows[0] || { role: req.user.role, staff_roles: [] });
   } catch (err) { next(err); }
 });
 
@@ -468,21 +483,15 @@ router.patch('/shoes/:id', requireRole('staff', 'admin'), async (req, res, next)
     const { rows: [before] } = await db.query(`SELECT * FROM shoes WHERE id = $1`, [req.params.id]);
     if (!before) return res.status(404).json({ error: 'Shoe not found' });
 
-    // Generate a KSM code on first listing if missing (new format includes size+gender).
-    // generateKsmCode never throws, so this can never abort the listing.
+    // Generate a KSM code on first listing if missing
     let extraUpdate = '';
     let extraValues = [];
     const newStatus = req.body.status;
     if (newStatus === 'listed' && !before.shoe_code) {
-      const code = await generateKsmCode(
-        req.body.brand  || before.brand,
-        req.body.size   || before.size,
-        req.body.gender || before.gender
-      );
-      if (code) {
-        extraUpdate = ', shoe_code = $' + (updates.length + 2);
-        extraValues.push(code);
-      }
+      const { generateUniqueShoeCode } = require('../services/shoeCodes');
+      const code = await generateUniqueShoeCode(req.body.brand || before.brand);
+      extraUpdate = ', shoe_code = $' + (updates.length + 2);
+      extraValues.push(code);
     }
     // Set listed_at timestamp when transitioning to listed
     if (newStatus === 'listed' && before.status !== 'listed') {
@@ -532,7 +541,7 @@ router.patch('/shoes/:id', requireRole('staff', 'admin'), async (req, res, next)
 // POST /api/admin/shoes/:id/note — add an internal/owner-visible note
 router.post('/shoes/:id/note', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
-    const { note, visible_to_owner } = req.body;
+    const { note } = req.body;
     if (!note) return res.status(400).json({ error: 'Note required' });
     const { rows: [shoe] } = await db.query(`SELECT id, status FROM shoes WHERE id = $1`, [req.params.id]);
     if (!shoe) return res.status(404).json({ error: 'Shoe not found' });
@@ -540,19 +549,29 @@ router.post('/shoes/:id/note', requireRole('staff', 'admin'), async (req, res, n
     const events = require('../services/submissionEvents');
     await events.logEvent({
       shoeId: req.params.id,
-      eventType: visible_to_owner === false ? 'internal_note' : 'note_added',
+      eventType: 'note_added',
       statusBefore: shoe.status,
       statusAfter: shoe.status,
       actorId: req.user.id,
       actorRole: 'kosmos',
       notes: note,
-      meta: { visible_to_owner: visible_to_owner !== false },
+      meta: { visible_to_owner: true },
     });
+
+    // Every note now opens / continues the customer chat thread for this listing,
+    // so Customer Service can pick it up from the Messages queue and follow it up.
+    try {
+      await db.query(
+        `INSERT INTO listing_messages (shoe_id, sender_id, sender_role, body, read_by_staff)
+         VALUES ($1, $2, 'kosmos', $3, true)`,
+        [String(req.params.id), req.user.id, note]
+      );
+    } catch (e) { console.error('[note→chat] message insert failed:', e.message); }
 
     await db.query(
       `INSERT INTO activity_log (actor_id, action, entity_type, entity_id, meta)
        VALUES ($1, 'note_added', 'shoe', $2, $3)`,
-      [req.user.id, req.params.id, JSON.stringify({ note, visible_to_owner: visible_to_owner !== false })]
+      [req.user.id, req.params.id, JSON.stringify({ note, chat: true })]
     );
 
     res.json({ ok: true });
@@ -576,7 +595,7 @@ router.get('/orders', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { rows } = await db.query(
       `SELECT o.*,
-              s.brand, s.model, s.emoji, s.size AS shoe_size, s.shoe_code,
+              s.brand, s.model, s.emoji,
               u.first_name || ' ' || u.last_name AS customer_name,
               u.email AS customer_email
        FROM orders o
@@ -607,9 +626,7 @@ router.get('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
       `SELECT s.*,
               u.first_name, u.last_name, u.email AS owner_email,
               u.first_name || ' ' || u.last_name AS owner_display,
-              ls.reference AS submission_ref, ls.collection_postcode,
-              (SELECT sp.url FROM shoe_photos sp WHERE sp.shoe_id = s.id
-                ORDER BY sp.is_cover DESC, sp.sort_order ASC, sp.uploaded_at ASC LIMIT 1) AS cover_url
+              ls.reference AS submission_ref, ls.collection_postcode
        FROM shoes s
        JOIN users u ON u.id = s.owner_id
        LEFT JOIN submission_shoes ss ON ss.shoe_id = s.id
@@ -812,10 +829,15 @@ router.post('/shoes', requireRole('staff', 'admin'), async (req, res, next) => {
     const initialStatus = status || 'awaiting_approval';
     const isListing = initialStatus === 'listed';
 
-    // Only generate a KSM code if creating as listed (new format includes size+gender)
+    // Only generate a KSM code if creating as listed
     let shoeCode = null;
     if (isListing) {
-      shoeCode = await generateKsmCode(brand, size, gender);
+      try {
+        const { generateUniqueShoeCode } = require('../services/shoeCodes');
+        shoeCode = await generateUniqueShoeCode(brand);
+      } catch (e) {
+        console.warn('Could not generate shoe code:', e.message);
+      }
     }
 
     // Probe which columns actually exist in the shoes table (defensive against partial migrations)
@@ -2094,20 +2116,31 @@ router.delete('/shoes/:shoeId/photos/:photoId', requireRole('staff', 'admin'), a
 // PATCH set a photo as the cover (display photo)
 router.patch('/shoes/:shoeId/photos/:photoId/cover', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
-    // Set the chosen photo as cover first (verifies it exists), then clear the rest.
-    // Uses plain db.query — no explicit transaction — so it works regardless of the db client shape.
-    const { rowCount } = await db.query(
-      `UPDATE shoe_photos SET is_cover = TRUE WHERE id = $1 AND shoe_id = $2`,
-      [req.params.photoId, req.params.shoeId]
-    );
-    if (!rowCount) {
-      return res.status(404).json({ error: 'Photo not found' });
+    // Unset previous cover for this shoe, then set the new one — single transaction
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE shoe_photos SET is_cover = FALSE WHERE shoe_id = $1`,
+        [req.params.shoeId]
+      );
+      const { rowCount } = await client.query(
+        `UPDATE shoe_photos SET is_cover = TRUE
+         WHERE id = $1 AND shoe_id = $2`,
+        [req.params.photoId, req.params.shoeId]
+      );
+      if (!rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Photo not found' });
+      }
+      await client.query('COMMIT');
+      res.json({ ok: true });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
     }
-    await db.query(
-      `UPDATE shoe_photos SET is_cover = FALSE WHERE shoe_id = $1 AND id <> $2`,
-      [req.params.shoeId, req.params.photoId]
-    );
-    res.json({ ok: true });
   } catch (err) {
     console.error('Set cover error:', err);
     res.status(500).json({ error: err.message || 'Could not set cover' });

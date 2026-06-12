@@ -21,6 +21,7 @@ const wishlistRoutes = require('./routes/wishlist');
 const stripeConnectRoutes = require('./routes/stripe_connect');
 const newsletterRoutes = require('./routes/newsletter');
 const verificationRoutes = require('./routes/verification');
+const messageRoutes = require('./routes/messages');
 const intakeRoutes = require('./routes/intake');
 const errorHandler = require('./middleware/errorHandler');
 const logger = require('./config/logger');
@@ -46,7 +47,6 @@ if (process.env.NODE_ENV === 'production') {
     next();
   });
 }
-
 // Security headers, including a strong HSTS policy (2 years, include subdomains,
 // preload) telling browsers to only ever connect to us over HTTPS.
 app.use(helmet({
@@ -125,6 +125,7 @@ app.use('/api/orders',      orderRoutes);
 app.use('/api/cleans',      cleanRoutes);
 app.use('/api/reviews',     reviewRoutes);
 app.use('/api/admin',       adminRoutes);
+app.use('/api/messages', messageRoutes);
 app.use('/api/admin/intake', intakeRoutes);
 app.use('/api/payouts',     payoutRoutes);
 app.use('/api/wishlist',   wishlistRoutes);
