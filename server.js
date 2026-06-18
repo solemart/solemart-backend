@@ -5,6 +5,7 @@ const cors = require('cors');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const authRoutes = require('./routes/auth');
+const assetRoutes = require('./routes/assets');
 const userRoutes = require('./routes/users');
 const shoeRoutes = require('./routes/shoes');
 const submissionRoutes = require('./routes/submissions');
@@ -95,6 +96,7 @@ const globalLimiter = rateLimit({ windowMs: 15*60*1000, max: 100, standardHeader
 const authLimiter = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error: 'Too many auth attempts.' } });
 app.use('/api', globalLimiter);
 app.use('/api/auth', authLimiter);
+app.use('/api/assets', assetRoutes);
 app.get('/health', (req, res) => { res.json({ status: 'ok', env: process.env.NODE_ENV, ts: new Date().toISOString() }); });
 
 // Public — non-sensitive settings the frontend uses for display
