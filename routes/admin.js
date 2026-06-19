@@ -822,11 +822,15 @@ router.get('/orders', requireRole('staff', 'admin'), async (req, res, next) => {
   try {
     const { rows } = await db.query(
       `SELECT o.*,
-              s.brand, s.model, s.emoji,
+              COALESCE(s.brand, a.title)                  AS brand,
+              COALESCE(s.model, ac.name)                  AS model,
+              COALESCE(s.emoji, a.emoji, ac.emoji, '📦')  AS emoji,
               u.first_name || ' ' || u.last_name AS customer_name,
               u.email AS customer_email
        FROM orders o
        LEFT JOIN shoes s ON s.id = o.shoe_id
+       LEFT JOIN assets a ON a.id = o.shoe_id
+       LEFT JOIN categories ac ON ac.id = a.category_id
        LEFT JOIN users u ON u.id = o.customer_id
        ORDER BY o.created_at DESC
        LIMIT 1000`

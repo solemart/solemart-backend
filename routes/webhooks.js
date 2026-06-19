@@ -216,15 +216,22 @@ router.post('/stripe', async (req, res) => {
             );
             const order = rows[0];
 
-            // Shoe → sold/rented + lifecycle bump
-            await db.query(
-              `UPDATE shoes SET status = $1, rental_count = rental_count + $2, updated_at = NOW() WHERE id = $3`,
-              [isRent ? 'rented' : 'sold', isRent ? 1 : 0, o.sid]
-            );
-            // Owner payout
+            // Item → sold/rented (footwear bumps rental_count; assets have no such column)
+            if (o.src === 'asset') {
+              await db.query(
+                `UPDATE assets SET status = $1, updated_at = NOW() WHERE id = $2`,
+                [isRent ? 'rented' : 'sold', o.sid]
+              );
+            } else {
+              await db.query(
+                `UPDATE shoes SET status = $1, rental_count = rental_count + $2, updated_at = NOW() WHERE id = $3`,
+                [isRent ? 'rented' : 'sold', isRent ? 1 : 0, o.sid]
+              );
+            }
+            // Owner payout (owner lives in `shoes` for footwear, `assets` otherwise)
             await db.query(
               `INSERT INTO payouts (owner_id, order_id, amount, payout_type, status)
-               SELECT s.owner_id, $1, $2, $3, 'pending' FROM shoes s WHERE s.id = $4`,
+               SELECT t.owner_id, $1, $2, $3, 'pending' FROM ${o.src === 'asset' ? 'assets' : 'shoes'} t WHERE t.id = $4`,
               [order.id, (order.subtotal * 0.85).toFixed(2), isRent ? 'rental' : 'sale', o.sid]
             );
             // Confirmation email
@@ -357,8 +364,9 @@ router.post('/stripe', async (req, res) => {
           let payload = [];
           try { payload = JSON.parse(m.orders || '[]'); } catch {}
           for (const o of payload) {
+            const table = o.src === 'asset' ? 'assets' : 'shoes';
             await db.query(
-              `UPDATE shoes SET status = 'listed', updated_at = NOW() WHERE id = $1 AND status = 'reserved'`,
+              `UPDATE ${table} SET status = 'listed', updated_at = NOW() WHERE id = $1 AND status = 'reserved'`,
               [o.sid]
             );
           }

@@ -212,33 +212,47 @@ router.post('/checkout', authenticate, async (req, res, next) => {
     const deliveryFeeAmount = await settings.getDeliveryFeeAmount();
 
     for (const item of items) {
-      const { rows: [shoe] } = await db.query(`SELECT * FROM shoes WHERE id = $1`, [item.shoe_id]);
-      if (!shoe) return res.status(404).json({ error: `Shoe ${item.shoe_id} not found` });
-      if (shoe.status !== 'listed') return res.status(409).json({ error: `${shoe.brand} ${shoe.model} is not available` });
+      // Footwear lives in `shoes`; every other category lives in `assets`.
+      // Look the item up in shoes first, then fall back to assets.
+      let { rows: [prod] } = await db.query(`SELECT * FROM shoes WHERE id = $1`, [item.shoe_id]);
+      let src = 'shoe';
+      if (!prod) {
+        const r = await db.query(
+          `SELECT a.*, c.name AS category_name FROM assets a
+             LEFT JOIN categories c ON c.id = a.category_id WHERE a.id = $1`, [item.shoe_id]);
+        prod = r.rows[0]; src = 'asset';
+      }
+      if (!prod) return res.status(404).json({ error: `Item ${item.shoe_id} not found` });
+      if (prod.status !== 'listed') {
+        const label = src === 'asset' ? (prod.title || 'This item') : `${prod.brand} ${prod.model}`;
+        return res.status(409).json({ error: `${label} is not available` });
+      }
 
       // Customer pays the listed price — no extras on top.
-      const unitPrice = item.order_type === 'rent' ? parseFloat(shoe.rent_price) : parseFloat(shoe.buy_price);
+      const unitPrice = item.order_type === 'rent' ? parseFloat(prod.rent_price) : parseFloat(prod.buy_price);
       const subtotal  = item.order_type === 'rent' ? unitPrice * item.rental_days : unitPrice;
       const total = parseFloat(subtotal.toFixed(2));
       const platformFee = parseFloat((subtotal * (platformFeePercent / 100)).toFixed(2));
       if (item.order_type === 'rent') hasRental = true;
       totalAmount += total;
 
+      const prodName = src === 'asset' ? (prod.title || prod.category_name || 'Item') : `${prod.brand} ${prod.model}`;
+      const sizePart = src === 'asset' ? '' : ` · UK ${prod.size}`;
       lineItems.push({
         price_data: {
           currency: 'gbp',
           product_data: {
-            name: `${shoe.brand} ${shoe.model}`,
+            name: prodName,
             description: item.order_type === 'rent'
-              ? `${item.rental_days}-day rental · UK ${shoe.size} · Cleaning & insurance included`
-              : `Purchase · UK ${shoe.size}`,
+              ? (src === 'asset' ? `${item.rental_days}-day rental` : `${item.rental_days}-day rental${sizePart} · Cleaning & insurance included`)
+              : (src === 'asset' ? 'Purchase' : `Purchase${sizePart}`),
           },
           unit_amount: Math.round(total * 100),
         },
         quantity: 1,
       });
 
-      orderInputs.push({ shoe, item, unitPrice, subtotal, platformFee, total });
+      orderInputs.push({ shoe: prod, src, item, unitPrice, subtotal, platformFee, total });
     }
 
     // Add delivery fee as a separate line if the order is below the free threshold
@@ -281,6 +295,7 @@ router.post('/checkout', authenticate, async (req, res, next) => {
     // checkout, a webhook (checkout.session.expired) releases the shoes.
     const orderPayload = orderInputs.map(o => ({
       sid: o.shoe.id,
+      src: o.src,
       ot: o.item.order_type,
       up: o.unitPrice,
       rd: o.item.order_type === 'rent' ? o.item.rental_days : null,
@@ -289,10 +304,11 @@ router.post('/checkout', authenticate, async (req, res, next) => {
       tot: o.total,
     }));
 
-    // Reserve each shoe now
+    // Reserve each item now (footwear in `shoes`, other categories in `assets`)
     for (const o of orderInputs) {
+      const table = o.src === 'asset' ? 'assets' : 'shoes';
       await db.query(
-        `UPDATE shoes SET status = 'reserved', updated_at = NOW() WHERE id = $1 AND status = 'listed'`,
+        `UPDATE ${table} SET status = 'reserved', updated_at = NOW() WHERE id = $1 AND status = 'listed'`,
         [o.shoe.id]
       );
     }
