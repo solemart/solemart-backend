@@ -67,6 +67,10 @@ const allowedOrigins = [
   'http://localhost:8081',
   'http://localhost:19006',
 ];
+const path = require('path');
+   app.get('/.well-known/apple-developer-domain-association.txt', (req, res) => {
+     res.type('text/plain').sendFile(path.join(__dirname, 'apple-developer-domain-association.txt'));
+   });
 app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no browser origin: native app, server-to-server,
